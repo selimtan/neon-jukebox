@@ -1,0 +1,44 @@
+# Build and package output
+/build/
+/out/
+/cmake-build-*/
+/_deps/
+*.zip
+
+# CMake generated files (including accidental in-source builds)
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+Testing/
+
+# Visual Studio and editor state
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Compiler and linker output
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.ilk
+*.idb
+*.pdb
+
+# Runtime and diagnostic output
+*.log
+*.dmp
+
+# Windows Explorer metadata
+Thumbs.db
+Desktop.ini
