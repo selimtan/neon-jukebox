@@ -13,6 +13,8 @@
 
 namespace neon {
 
+enum class UiSoundEffect { Coin, PageTurn };
+
 struct AudioVisualizationFrame {
     static constexpr std::size_t bandCount = 64;
     static constexpr std::size_t waveformSampleCount = 256;
@@ -62,7 +64,7 @@ public:
     AudioEngine(const AudioEngine&) = delete;
     AudioEngine& operator=(const AudioEngine&) = delete;
 
-    bool initialize(std::string& error);
+    bool initialize(std::string& error, const std::filesystem::path& effectsDirectory = {});
     void shutdown();
     bool play(const Track& track, std::int64_t startMs, std::string& error);
     void stop();
@@ -70,6 +72,9 @@ public:
     bool resume();
     bool seek(std::int64_t milliseconds);
     void setVolume(float volume);
+    void setEffectsEnabled(bool enabled);
+    bool playEffect(UiSoundEffect effect);
+    [[nodiscard]] std::string takeEffectError();
 
     [[nodiscard]] bool initialized() const { return mixer_ != nullptr; }
     [[nodiscard]] bool playing() const;
@@ -89,6 +94,12 @@ private:
     MIX_Mixer* mixer_{};
     MIX_Track* track_{};
     MIX_Audio* audio_{};
+    std::array<MIX_Audio*, 2> effectAudio_{};
+    // Three overlapping coin drops and one dedicated mechanical page sound.
+    std::array<MIX_Track*, 4> effectTracks_{};
+    std::size_t nextCoinVoice_{};
+    bool effectsEnabled_{};
+    std::string effectError_;
     std::atomic_bool finished_{};
     std::atomic_bool acceptFinished_{};
     bool paused_{};

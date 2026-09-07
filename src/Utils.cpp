@@ -51,6 +51,18 @@ std::string normalizeForSearch(std::string_view value) {
     return toUtf8(lowered);
 }
 
+std::string uppercaseForDisplay(std::string_view value) {
+    const auto wide = fromUtf8(value);
+    if (wide.empty()) return {};
+    const int count = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE,
+        wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (count <= 0) return std::string(value);
+    std::wstring upper(static_cast<std::size_t>(count), L'\0');
+    LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE,
+        wide.data(), static_cast<int>(wide.size()), upper.data(), count, nullptr, nullptr, 0);
+    return toUtf8(upper);
+}
+
 std::string hexEncode(std::span<const std::uint8_t> bytes) {
     static constexpr char digits[] = "0123456789abcdef";
     std::string output(bytes.size() * 2, '0');

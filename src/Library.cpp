@@ -1,5 +1,7 @@
 #include "neon/Library.hpp"
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -14,6 +16,7 @@
 #include <tfile.h>
 
 #include "neon/Utils.hpp"
+#include "neon/BackgroundIo.hpp"
 
 namespace neon {
 namespace {
@@ -54,7 +57,73 @@ bool embeddedArtworkAvailable(const TagLib::FileRef& reference) {
     return false;
 }
 
+std::wstring browseName(std::string_view value) {
+    auto wide = fromUtf8(trimmed(std::string(value)));
+    // The A-Z index groups both Turkish forms of I with the I key.
+    for (auto& letter : wide) if (letter == L'ı' || letter == L'İ') letter = L'I';
+    return wide;
+}
+
+int compareNames(std::wstring_view left, std::wstring_view right) {
+    if (left.empty() || right.empty()) return left.empty() ? (right.empty() ? 0 : -1) : 1;
+    const int result = CompareStringEx(LOCALE_NAME_INVARIANT,
+        NORM_IGNORECASE | NORM_IGNORENONSPACE | SORT_DIGITSASNUMBERS,
+        left.data(), static_cast<int>(left.size()), right.data(), static_cast<int>(right.size()),
+        nullptr, nullptr, 0);
+    return result ? result - CSTR_EQUAL : left.compare(right);
+}
+
+bool matchesArtistInitial(std::wstring_view artist, char initial) {
+    if (!initial) return true;
+    if (artist.empty()) return false;
+    const wchar_t first = artist.front();
+    if (initial == '#') return first >= L'0' && first <= L'9';
+    const wchar_t letter = initial;
+    return compareNames(artist.substr(0, 1), std::wstring_view(&letter, 1)) == 0;
+}
+
 }  // namespace
+
+TrackLabel trackLabel(const Track& track) {
+    if (track.mediaKind != MediaKind::Video) return {track.artist, track.title};
+    const auto trim = [](std::string value) {
+        const auto first = value.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return std::string{};
+        return value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
+    };
+    auto artist = trim(track.artist);
+    auto title = trim(track.title.empty() ? pathToUtf8(track.path.stem()) : track.title);
+    const bool unknown = artist.empty() || normalizeForSearch(artist) == "unknown artist";
+    // Untagged music videos commonly keep "Artist - Clip" in the file title.
+    // Tagged artist metadata wins; only remove a matching repeated prefix.
+    for (const std::string_view separator : {" - ", " – ", " — ", " _ ", "_ "}) {
+        const auto split = title.find(separator);
+        if (split == std::string::npos) continue;
+        const auto prefix = trim(title.substr(0, split));
+        const auto clip = trim(title.substr(split + separator.size()));
+        if (!prefix.empty() && !clip.empty() &&
+            (unknown || normalizeForSearch(prefix) == normalizeForSearch(artist))) {
+            if (unknown) artist = prefix;
+            title = clip;
+        }
+        break;
+    }
+    // Keep mix/live/version names, but omit upload-format annotations from the label.
+    for (;;) {
+        const auto upper = uppercaseForDisplay(title);
+        bool removed = false;
+        for (const std::string_view suffix : {" (OFFICIAL MUSIC VIDEO)", " (OFFICIAL VIDEO)", " (OFFICIAL)",
+             " [OFFICIAL MUSIC VIDEO]", " [OFFICIAL VIDEO]", " (HD)", " [HD]", " (4K)", " [4K]"}) {
+            if (upper.size() > suffix.size() && upper.ends_with(suffix)) {
+                title = trim(title.substr(0, title.size() - suffix.size()));
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) break;
+    }
+    return {artist.empty() ? "Unknown Artist" : artist, title};
+}
 
 LibraryIndex LibraryScanner::scan(std::span<const std::filesystem::path> musicRoots,
                                   std::span<const std::filesystem::path> videoRoots,
@@ -65,14 +134,60 @@ LibraryIndex LibraryScanner::scan(std::span<const std::filesystem::path> musicRo
                                   const ErrorCallback& onError,
                                   const TrackCallback& onTrack) const {
     LibraryIndex result;
+    const auto cancelled = [cancel] { return cancel && cancel->load(std::memory_order_acquire); };
+    if (cancelled()) return result;
+    BackgroundIoCancellation cancelIo(cancelled);
 
     std::unordered_map<std::string, const Track*> cachedByPath;
     cachedByPath.reserve(cached.tracks.size());
-    for (const auto& track : cached.tracks) cachedByPath.emplace(normalizedPathKey(track.path), &track);
+    // These paths were resolved when scanned. Indexing the saved catalogue must
+    // not touch thousands of files on sleeping/removable/network drives.
+    const auto cacheKey = [](const std::filesystem::path& path) {
+        return normalizeForSearch(pathToUtf8(path.lexically_normal()));
+    };
+    for (const auto& track : cached.tracks) {
+        if (cancelled()) return result;
+        cachedByPath.emplace(cacheKey(track.path), &track);
+    }
     const std::unordered_set<std::string> favorites(favoriteIds.begin(), favoriteIds.end());
 
-    struct Candidate { std::filesystem::path path; MediaKind mediaKind; };
-    std::vector<Candidate> files;
+    ScanProgress state;
+    const auto processFile = [&](const std::filesystem::path& file, MediaKind mediaKind) {
+        if (cancelled()) return;
+        ++state.discovered;
+        state.currentFile = pathToUtf8(file);
+        if (progress) progress(state);
+        try {
+            const auto size = std::filesystem::file_size(file);
+            if (cancelled()) return;
+            const auto ticks = modifiedTicks(file);
+            if (cancelled()) return;
+            const auto found = cachedByPath.find(cacheKey(file));
+            Track track;
+            if (found != cachedByPath.end() && found->second->fileSize == size &&
+                found->second->modifiedTicks == ticks) {
+                track = *found->second;
+                track.mediaKind = mediaKind;
+                track.favorite = favorites.contains(track.id) || track.favorite;
+                // Artwork files can be added or removed without changing the audio file.
+                track.sidecarArtwork = findSidecar(file);
+            } else {
+                track = readTrack(file, false, mediaKind);
+                track.favorite = favorites.contains(track.id);
+            }
+            if (cancelled()) return;
+            result.tracks.push_back(std::move(track));
+            if (onTrack) onTrack(result.tracks.back());
+        } catch (const std::exception& exception) {
+            // A malformed or concurrently removed file must not abort the scan.
+            if (onError && !cancelled()) onError(file, exception.what());
+        } catch (...) {
+            if (onError && !cancelled()) onError(file, "Unknown metadata error");
+        }
+        ++state.processed;
+        if (progress) progress(state);
+    };
+
     std::unordered_set<std::string> seenFiles;
     const auto discover = [&](std::span<const std::filesystem::path> roots, MediaKind mediaKind,
                               std::vector<std::filesystem::path>& acceptedRoots) {
@@ -81,14 +196,20 @@ LibraryIndex LibraryScanner::scan(std::span<const std::filesystem::path> musicRo
             if (cancel && cancel->load(std::memory_order_relaxed)) break;
             if (requestedRoot.empty()) continue;
 
+            state.currentFile = pathToUtf8(requestedRoot);
+            if (progress) progress(state);
+            if (cancelled()) break;
+
             std::error_code error;
             const auto canonical = std::filesystem::weakly_canonical(requestedRoot, error);
+            if (cancelled()) break;
             const auto root = error ? requestedRoot.lexically_normal() : canonical;
             error.clear();
-            if (!seenRoots.insert(normalizedPathKey(root)).second) continue;
+            if (!seenRoots.insert(cacheKey(root)).second) continue;
             acceptedRoots.push_back(root);
 
             if (!std::filesystem::is_directory(root, error) || error) {
+                if (cancelled()) break;
                 if (onError) onError(root, error ? error.message() : "Media source is not a directory");
                 continue;
             }
@@ -97,61 +218,34 @@ LibraryIndex LibraryScanner::scan(std::span<const std::filesystem::path> musicRo
                  it != end; it.increment(error)) {
                 if (cancel && cancel->load(std::memory_order_relaxed)) break;
                 if (error) { error.clear(); continue; }
+                // Publish before filesystem/metadata access, including folders
+                // with no supported media and slow removable/network sources.
+                state.currentFile = pathToUtf8(it->path());
+                if (progress) progress(state);
+                if (cancelled()) break;
                 const bool supported = mediaKind == MediaKind::Music
                     ? isSupportedAudioFile(it->path()) : isSupportedVideoFile(it->path());
                 if (it->is_regular_file(error) && !error && supported &&
-                    seenFiles.insert(normalizedPathKey(it->path())).second) {
-                    files.push_back({it->path(), mediaKind});
+                    seenFiles.insert(cacheKey(it->path())).second) {
+                    // Publish each playable track before walking the remaining folders.
+                    processFile(it->path(), mediaKind);
                 }
+                if (cancelled()) break; // Do not advance the directory iterator after cancellation.
             }
         }
     };
     discover(musicRoots, MediaKind::Music, result.musicRoots);
     discover(videoRoots, MediaKind::Video, result.videoRoots);
-    std::ranges::sort(files, [](const auto& left, const auto& right) {
-        return normalizeForSearch(pathToUtf8(left.path)) < normalizeForSearch(pathToUtf8(right.path));
-    });
-
-    result.tracks.reserve(files.size());
-    ScanProgress state{files.size(), 0, {}};
-    for (const auto& candidate : files) {
-        if (cancel && cancel->load(std::memory_order_relaxed)) break;
-        const auto& file = candidate.path;
-        state.currentFile = pathToUtf8(file.filename());
-        if (progress) progress(state);
-        try {
-            const auto size = std::filesystem::file_size(file);
-            const auto ticks = modifiedTicks(file);
-            const auto found = cachedByPath.find(normalizedPathKey(file));
-            if (found != cachedByPath.end() && found->second->fileSize == size &&
-                found->second->modifiedTicks == ticks) {
-                Track track = *found->second;
-                track.mediaKind = candidate.mediaKind;
-                track.favorite = favorites.contains(track.id) || track.favorite;
-                // Artwork files can be added or removed without changing the audio file.
-                track.sidecarArtwork = findSidecar(file);
-                result.tracks.push_back(std::move(track));
-                if (onTrack) onTrack(result.tracks.back());
-            } else {
-                Track track = readTrack(file, false, candidate.mediaKind);
-                track.favorite = favorites.contains(track.id);
-                result.tracks.push_back(std::move(track));
-                if (onTrack) onTrack(result.tracks.back());
-            }
-        } catch (const std::exception& exception) {
-            // A malformed or concurrently removed file must not abort the scan.
-            if (onError) onError(file, exception.what());
-        } catch (...) {
-            if (onError) onError(file, "Unknown metadata error");
-        }
-        ++state.processed;
+    if (cancelled()) {
+        if (progress) { state.currentFile.clear(); progress(state); }
+        return result;
     }
 
-    std::ranges::sort(result.tracks, [](const Track& left, const Track& right) {
-        const auto leftKey = normalizeForSearch(left.artist + "\n" + left.album + "\n" + left.title);
-        const auto rightKey = normalizeForSearch(right.artist + "\n" + right.album + "\n" + right.title);
-        return leftKey < rightKey;
-    });
+    const auto ordered = filter(result, {}, LibraryFilter::All);
+    std::vector<Track> sorted;
+    sorted.reserve(ordered.size());
+    for (const auto index : ordered) sorted.push_back(std::move(result.tracks[index]));
+    result.tracks = std::move(sorted);
     result.scannedAtMs = nowUnixMs();
     if (progress) { state.currentFile.clear(); progress(state); }
     return result;
@@ -160,9 +254,18 @@ LibraryIndex LibraryScanner::scan(std::span<const std::filesystem::path> musicRo
 std::vector<std::size_t> LibraryScanner::filter(const LibraryIndex& library,
                                                 std::string_view query,
                                                 LibraryFilter filter,
-                                                std::string_view genre) {
+                                                std::string_view genre,
+                                                char artistInitial) {
     const auto needle = normalizeForSearch(query);
     const auto genreNeedle = normalizeForSearch(genre);
+    struct BrowseEntry {
+        std::size_t index;
+        std::wstring artist;
+        std::wstring title;
+        std::wstring album;
+    };
+    std::vector<BrowseEntry> entries;
+    entries.reserve(library.tracks.size());
     std::vector<std::size_t> output;
     output.reserve(library.tracks.size());
     for (std::size_t i = 0; i < library.tracks.size(); ++i) {
@@ -171,12 +274,27 @@ std::vector<std::size_t> LibraryScanner::filter(const LibraryIndex& library,
         if (filter == LibraryFilter::Music && track.mediaKind != MediaKind::Music) continue;
         if (filter == LibraryFilter::Video && track.mediaKind != MediaKind::Video) continue;
         if (!genreNeedle.empty() && normalizeForSearch(track.genre) != genreNeedle) continue;
+        const auto label = trackLabel(track);
+        auto artist = browseName(label.artist);
+        if (!matchesArtistInitial(artist, artistInitial)) continue;
         if (needle.empty() || contains(normalizeForSearch(track.title), needle) ||
-            contains(normalizeForSearch(track.artist), needle) ||
+            contains(normalizeForSearch(label.title), needle) ||
+            contains(normalizeForSearch(label.artist), needle) ||
             contains(normalizeForSearch(track.album), needle) ||
             contains(normalizeForSearch(track.genre), needle) ||
-            (track.albumYear > 0 && contains(std::to_string(track.albumYear), needle))) output.push_back(i);
+            (track.albumYear > 0 && contains(std::to_string(track.albumYear), needle))) {
+            entries.push_back({i, std::move(artist), browseName(label.title), browseName(track.album)});
+        }
     }
+    // Sort visible indices as well as completed scans: cached libraries and
+    // incremental arrivals must use the same artist-first order immediately.
+    std::ranges::sort(entries, [&](const BrowseEntry& left, const BrowseEntry& right) {
+        if (const int artist = compareNames(left.artist, right.artist)) return artist < 0;
+        if (const int title = compareNames(left.title, right.title)) return title < 0;
+        if (const int album = compareNames(left.album, right.album)) return album < 0;
+        return library.tracks[left.index].id < library.tracks[right.index].id;
+    });
+    for (const auto& entry : entries) output.push_back(entry.index);
     return output;
 }
 

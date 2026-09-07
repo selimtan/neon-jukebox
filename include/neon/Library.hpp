@@ -12,10 +12,18 @@
 
 namespace neon {
 
+struct TrackLabel {
+    std::string artist;
+    std::string title;
+};
+// One interpretation for both catalogue labels and search/sort/A-Z filtering.
+// Saved tags take precedence; untagged video names may contain "Artist - Clip".
+TrackLabel trackLabel(const Track& track);
+
 struct ScanProgress {
     std::size_t discovered{};
     std::size_t processed{};
-    std::string currentFile;
+    std::string currentFile; // Full path of the folder or file currently being scanned.
 };
 
 class LibraryScanner {
@@ -36,7 +44,8 @@ public:
     static std::vector<std::size_t> filter(const LibraryIndex& library,
                                            std::string_view query,
                                            LibraryFilter filter,
-                                           std::string_view genre = {});
+                                           std::string_view genre = {},
+                                           char artistInitial = '\0');
     static std::vector<std::string> genres(const LibraryIndex& library);
     static const Track* find(const LibraryIndex& library, std::string_view id);
 

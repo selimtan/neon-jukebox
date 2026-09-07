@@ -1,4 +1,5 @@
 #include "neon/Visualizer.hpp"
+#include "neon/Drawing.hpp"
 
 #include <algorithm>
 #include <array>
@@ -75,24 +76,14 @@ void fill(SDL_Renderer* renderer, const SDL_FRect& rect, SDL_Color value) {
 }
 
 void line(SDL_Renderer* renderer, float x1, float y1, float x2, float y2, SDL_Color value) {
-    color(renderer, value);
-    SDL_RenderLine(renderer, x1, y1, x2, y2);
+    drawing::line(renderer, x1, y1, x2, y2, value);
 }
 
 void polyline(SDL_Renderer* renderer, const std::vector<SDL_FPoint>& points,
               SDL_Color value, int width = 1) {
-    if (points.size() < 2) return;
-    color(renderer, value);
-    const int half = std::max(0, width / 2);
-    for (int offset = -half; offset <= half; ++offset) {
-        if (offset == 0) {
-            SDL_RenderLines(renderer, points.data(), static_cast<int>(points.size()));
-            continue;
-        }
-        std::vector<SDL_FPoint> shifted = points;
-        for (auto& point : shifted) point.y += static_cast<float>(offset);
-        SDL_RenderLines(renderer, shifted.data(), static_cast<int>(shifted.size()));
-    }
+    const bool closed = points.size() > 2 &&
+        std::hypot(points.front().x - points.back().x, points.front().y - points.back().y) < 0.001F;
+    drawing::stroke(renderer, points, value, static_cast<float>(width), closed);
 }
 
 void glowLine(SDL_Renderer* renderer, float x1, float y1, float x2, float y2,
@@ -129,13 +120,7 @@ void circle(SDL_Renderer* renderer, float cx, float cy, float radius, SDL_Color 
 }
 
 void fillCircle(SDL_Renderer* renderer, float cx, float cy, float radius, SDL_Color value) {
-    color(renderer, value);
-    const int extent = static_cast<int>(std::ceil(radius));
-    for (int y = -extent; y <= extent; ++y) {
-        const float half = std::sqrt(std::max(0.0F, radius * radius - static_cast<float>(y * y)));
-        SDL_RenderLine(renderer, cx - half, cy + static_cast<float>(y),
-                      cx + half, cy + static_cast<float>(y));
-    }
+    drawing::disc(renderer, cx, cy, radius, value);
 }
 
 void base(SDL_Renderer* renderer, const SDL_FRect& rect, bool warm = false) {
@@ -163,7 +148,12 @@ void base(SDL_Renderer* renderer, const SDL_FRect& rect, bool warm = false) {
 
 float bandAt(const std::array<float, AudioVisualizationFrame::bandCount>& bands,
              std::size_t index, std::size_t count) {
-    if (count <= 1) return bands.front();
+    if (count < bands.size()) {
+        // Reduced column counts still cover every input band, including narrow peaks.
+        const auto begin = index * bands.size() / std::max<std::size_t>(1, count);
+        const auto end = (index + 1) * bands.size() / std::max<std::size_t>(1, count);
+        return *std::max_element(bands.begin() + begin, bands.begin() + end);
+    }
     const float source = static_cast<float>(index) * static_cast<float>(bands.size() - 1) /
                          static_cast<float>(count - 1);
     const auto low = static_cast<std::size_t>(source);
@@ -186,20 +176,7 @@ void glowingRect(SDL_Renderer* renderer, const SDL_FRect& rect, SDL_Color value)
 
 void fillQuad(SDL_Renderer* renderer, const std::array<SDL_FPoint, 4>& points,
               SDL_Color value) {
-    const SDL_FColor vertexColor{
-        static_cast<float>(value.r) / 255.0F,
-        static_cast<float>(value.g) / 255.0F,
-        static_cast<float>(value.b) / 255.0F,
-        static_cast<float>(value.a) / 255.0F
-    };
-    std::array<SDL_Vertex, 4> vertices{};
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
-        vertices[i].position = points[i];
-        vertices[i].color = vertexColor;
-    }
-    constexpr std::array<int, 6> indices{0, 1, 2, 0, 2, 3};
-    SDL_RenderGeometry(renderer, nullptr, vertices.data(), static_cast<int>(vertices.size()),
-                       indices.data(), static_cast<int>(indices.size()));
+    drawing::convex(renderer, points, value);
 }
 
 std::array<std::uint8_t, 7> pixelGlyph(char character) {
@@ -302,6 +279,7 @@ void VisualizerRenderer::setTextRenderer(TextRenderer renderer) {
 void VisualizerRenderer::pixelText(SDL_Renderer* renderer, std::string_view text,
                                    float centerX, float top, float pixel,
                                    SDL_Color value) const {
+    if (pixel * 7.0F * pixelsPerUnit_ < 5.5F) return;
     if (!textRenderer_) {
         drawPixelText(renderer, text, centerX, top, pixel, value);
         return;
@@ -400,8 +378,24 @@ void VisualizerRenderer::update(const AudioVisualizationFrame& frame, std::uint6
     }
 }
 
+int VisualizerRenderer::detailCount(float span, float minimumPixelPitch, int maximum,
+                                    int minimum) const {
+    return std::clamp(static_cast<int>(std::floor(span * pixelsPerUnit_ / minimumPixelPitch)),
+                      minimum, maximum);
+}
+
 void VisualizerRenderer::draw(SDL_Renderer* renderer, const SDL_FRect& rect,
-                              VisualizerMode mode) const {
+                              VisualizerMode mode, float pixelsPerUnit) {
+    if (rect.w < 8 || rect.h < 8) return;
+    pixelsPerUnit_ = std::clamp(pixelsPerUnit, 0.1F, 8.0F);
+    SDL_Rect previousClip{};
+    const bool clipped = SDL_RenderClipEnabled(renderer);
+    SDL_GetRenderClipRect(renderer, &previousClip);
+    SDL_Rect clip{static_cast<int>(std::ceil(rect.x)), static_cast<int>(std::ceil(rect.y)),
+                  static_cast<int>(std::floor(rect.x + rect.w) - std::ceil(rect.x)),
+                  static_cast<int>(std::floor(rect.y + rect.h) - std::ceil(rect.y))};
+    if (clipped && !SDL_GetRectIntersection(&previousClip, &clip, &clip)) return;
+    SDL_SetRenderClipRect(renderer, &clip);
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
     switch (mode) {
         case VisualizerMode::ReferenceVu: drawReferenceVu(renderer, rect); break;
@@ -416,6 +410,7 @@ void VisualizerRenderer::draw(SDL_Renderer* renderer, const SDL_FRect& rect,
         case VisualizerMode::CavaMonstercat: drawCavaMonstercat(renderer, rect); break;
         case VisualizerMode::PrismReflect: drawPrismReflect(renderer, rect); break;
         case VisualizerMode::PhosphorScope: drawPhosphorScope(renderer, rect); break;
+        case VisualizerMode::RetroPhosphorScope: drawPhosphorScope(renderer, rect, true); break;
         case VisualizerMode::LissajousPro: drawLissajousPro(renderer, rect); break;
         case VisualizerMode::RadialInferno: drawRadialInferno(renderer, rect); break;
         case VisualizerMode::CircularWave: drawCircularWave(renderer, rect); break;
@@ -433,6 +428,7 @@ void VisualizerRenderer::draw(SDL_Renderer* renderer, const SDL_FRect& rect,
         case VisualizerMode::WarmTwinVu: drawWarmTwinVu(renderer, rect); break;
         default: drawAurora(renderer, rect); break;
     }
+    SDL_SetRenderClipRect(renderer, clipped ? &previousClip : nullptr);
 }
 
 std::string_view VisualizerRenderer::name(VisualizerMode mode) {
@@ -444,7 +440,7 @@ std::string_view VisualizerRenderer::name(VisualizerMode mode) {
         "Circular Wave", "Magma Spectrogram", "MilkDrop Motion Mesh",
         "Particle Galaxy", "Mastering Dashboard", "Vintage Flat VU",
         "OW Level Meter", "Rackmount Spectrum", "Green dB Meter", "Spectrum Skyline",
-        "Neon Mosaic", "Triple Sound Meter", "Warm Twin VU"};
+        "Neon Mosaic", "Triple Sound Meter", "Warm Twin VU", "Retro Phosphor"};
     return names[modeIndex(mode)];
 }
 
@@ -477,13 +473,14 @@ std::string_view VisualizerRenderer::subtitle(VisualizerMode mode) {
         "Three-zone LED skyline · green, amber and red · perspective floor reflection",
         "Independent chroma columns · segmented neon bars · pure black contrast",
         "Triple analog dB gauges · three miniature RTAs · tri-color scale",
-        "Dual backlit VU windows · warm ivory faces · classic black needles"};
+        "Dual backlit VU windows · warm ivory faces · classic black needles",
+        "Phosphor-green waveform · dark green screen · fading signal trails"};
     return subtitles[modeIndex(mode)];
 }
 
 void VisualizerRenderer::drawAurora(SDL_Renderer* renderer, const SDL_FRect& rect) const {
     base(renderer, rect);
-    const std::size_t count = static_cast<std::size_t>(std::clamp(rect.w / 11.0F, 24.0F, 48.0F));
+    const std::size_t count = detailCount(rect.w - 24, 16, 48);
     const float gap = rect.w > 700.0F ? 5.0F : 3.0F;
     const float width = (rect.w - 24.0F - gap * static_cast<float>(count - 1)) /
                         static_cast<float>(count);
@@ -519,18 +516,20 @@ void VisualizerRenderer::drawReferenceVu(SDL_Renderer* renderer, const SDL_FRect
                  mix({28, 22, 13, 255}, {7, 8, 10, 255}, t));
         }
         color(renderer, {197, 154, 80, 105});
-        SDL_RenderRect(renderer, &face);
+        drawing::outline(renderer, &face);
         const float cx = rect.x + meterWidth * (static_cast<float>(meter) + 0.5F);
         const float cy = rect.y + rect.h * 0.84F;
         const float radius = std::min(meterWidth * 0.40F, rect.h * 0.67F);
         arc(renderer, cx, cy, radius + 2.0F, pi * 1.12F, pi * 1.88F, {255, 222, 166, 62}, 2);
         arc(renderer, cx, cy, radius * 0.82F, pi * 1.12F, pi * 1.88F, {255, 222, 166, 38});
         arc(renderer, cx, cy, radius + 3.0F, pi * 1.70F, pi * 1.88F, {255, 70, 64, 150}, 3);
-        for (int tick = 0; tick <= 20; ++tick) {
-            const float angle = pi * (1.12F + 0.038F * static_cast<float>(tick));
-            const bool major = tick % 5 == 0;
+        const int ticks = detailCount(radius * pi * 0.76F, 8, 20, 4);
+        for (int tick = 0; tick <= ticks; ++tick) {
+            const float fraction = static_cast<float>(tick) / ticks;
+            const float angle = pi * (1.12F + 0.76F * fraction);
+            const bool major = tick == 0 || tick == ticks || tick % 5 == 0;
             const float inner = radius - (major ? 15.0F : tick % 2 == 0 ? 10.0F : 6.0F);
-            const SDL_Color tickColor = tick > 15 ? SDL_Color{255, 84, 72, 220}
+            const SDL_Color tickColor = fraction > 0.75F ? SDL_Color{255, 84, 72, 220}
                                                  : SDL_Color{255, 228, 185, 180};
             line(renderer, cx + std::cos(angle) * inner, cy + std::sin(angle) * inner,
                  cx + std::cos(angle) * radius, cy + std::sin(angle) * radius, tickColor);
@@ -559,10 +558,11 @@ void VisualizerRenderer::drawNeonArcVu(SDL_Renderer* renderer, const SDL_FRect& 
         const float radius = std::min(meterWidth * 0.37F, rect.h * 0.49F);
         const float value = std::clamp(meter == 0 ? vuLeft_ : vuRight_, 0.0F, 1.0F);
         const SDL_Color active = meter == 0 ? cyan : pink;
-        for (int segment = 0; segment < 23; ++segment) {
-            const float start = pi * (1.05F + static_cast<float>(segment) * 0.9F / 23.0F);
-            const float end = start + pi * 0.025F;
-            const bool on = static_cast<float>(segment) / 23.0F < value;
+        const int segments = detailCount(radius * pi * 0.9F, 10, 23, 4);
+        for (int segment = 0; segment < segments; ++segment) {
+            const float start = pi * (1.05F + static_cast<float>(segment) * 0.9F / segments);
+            const float end = start + pi * 0.64F / segments;
+            const bool on = static_cast<float>(segment) / segments < value;
             if (on) arc(renderer, cx, cy, radius + 2.0F, start, end, withAlpha(active, 35), 7, 4);
             arc(renderer, cx, cy, radius, start, end,
                 on ? active : SDL_Color{94, 112, 147, 42}, 4, 4);
@@ -577,7 +577,7 @@ void VisualizerRenderer::drawMirrorStage(SDL_Renderer* renderer, const SDL_FRect
     const float middle = rect.y + rect.h / 2.0F;
     line(renderer, rect.x + 10.0F, middle, rect.x + rect.w - 10.0F, middle,
          withAlpha(ink, 75));
-    const std::size_t count = static_cast<std::size_t>(std::clamp(rect.w / 13.0F, 22.0F, 48.0F));
+    const std::size_t count = detailCount(rect.w - 26, 16, 48);
     const float gap = rect.w > 700.0F ? 5.0F : 3.0F;
     const float width = (rect.w - 26.0F - gap * static_cast<float>(count - 1)) /
                         static_cast<float>(count);
@@ -593,13 +593,17 @@ void VisualizerRenderer::drawMirrorStage(SDL_Renderer* renderer, const SDL_FRect
 
 void VisualizerRenderer::drawWaterfall(SDL_Renderer* renderer, const SDL_FRect& rect) const {
     base(renderer, rect);
-    const float cellWidth = rect.w / static_cast<float>(AudioVisualizationFrame::bandCount);
-    const float cellHeight = rect.h / static_cast<float>(waterfallRows);
-    for (std::size_t row = 0; row < waterfallRows; ++row) {
-        const std::size_t sourceRow = (waterfallHead_ + row) % waterfallRows;
-        const float age = static_cast<float>(row) / static_cast<float>(waterfallRows - 1);
-        for (std::size_t column = 0; column < AudioVisualizationFrame::bandCount; ++column) {
-            const float level = waterfall_[sourceRow][column] * (1.0F - age * 0.52F);
+    const std::size_t columns = detailCount(rect.w, 8, AudioVisualizationFrame::bandCount);
+    const std::size_t rows = detailCount(rect.h, 6, waterfallRows);
+    const float cellWidth = rect.w / static_cast<float>(columns);
+    const float cellHeight = rect.h / static_cast<float>(rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+        const float age = static_cast<float>(row) / static_cast<float>(rows - 1);
+        for (std::size_t column = 0; column < columns; ++column) {
+            float sample = 0;
+            for (auto sourceRow = row * waterfallRows / rows; sourceRow < (row + 1) * waterfallRows / rows; ++sourceRow)
+                sample = std::max(sample, bandAt(waterfall_[(waterfallHead_ + sourceRow) % waterfallRows], column, columns));
+            const float level = sample * (1.0F - age * 0.52F);
             const SDL_Color heat = level > 0.78F ? pink : level > 0.52F ? violet :
                                    level > 0.28F ? blue : cyan;
             const Uint8 alpha = static_cast<Uint8>(std::clamp(45.0F + level * 210.0F, 0.0F, 255.0F));
@@ -621,7 +625,7 @@ void VisualizerRenderer::drawOrbitVinyl(SDL_Renderer* renderer, const SDL_FRect&
     const float cx = rect.x + rect.w / 2.0F;
     const float cy = rect.y + rect.h / 2.0F;
     const float inner = std::min(rect.w, rect.h) * 0.23F;
-    constexpr std::size_t spokes = 64;
+    const std::size_t spokes = detailCount(inner * pi * 2, 8, 64, 8);
     for (std::size_t i = 0; i < spokes; ++i) {
         const float angle = static_cast<float>(i) / static_cast<float>(spokes) * pi * 2.0F + rotation_;
         const float level = bandAt(displayBands_, i, spokes) * std::min(rect.w, rect.h) * 0.19F;
@@ -690,19 +694,20 @@ void VisualizerRenderer::drawSignalRibbon(SDL_Renderer* renderer, const SDL_FRec
 
 void VisualizerRenderer::drawStudioLed(SDL_Renderer* renderer, const SDL_FRect& rect) const {
     base(renderer, rect);
-    constexpr std::size_t columns = AudioVisualizationFrame::bandCount;
-    constexpr int rows = 10;
     const float pad = std::max(8.0F, rect.w * 0.025F);
+    const std::size_t columns = detailCount(rect.w - pad * 2, 18, AudioVisualizationFrame::bandCount);
+    const int rows = detailCount(rect.h - 18, 12, 10);
     const float gap = rect.w > 700.0F ? 5.0F : 3.0F;
     const float width = (rect.w - pad * 2.0F - gap * static_cast<float>(columns - 1)) /
                         static_cast<float>(columns);
     const float height = (rect.h - 18.0F - gap * static_cast<float>(rows - 1)) /
                          static_cast<float>(rows);
     for (std::size_t column = 0; column < columns; ++column) {
-        const int active = static_cast<int>(std::lround(displayBands_[column] * rows));
+        const int active = static_cast<int>(std::lround(bandAt(displayBands_, column, columns) * rows));
         for (int row = 0; row < rows; ++row) {
             const bool on = rows - row <= active;
-            const SDL_Color zone = row < 2 ? red : row < 5 ? amber : green;
+            const float position = static_cast<float>(row) / rows;
+            const SDL_Color zone = position < 0.2F ? red : position < 0.5F ? amber : green;
             const SDL_FRect led{rect.x + pad + static_cast<float>(column) * (width + gap),
                                 rect.y + 8.0F + static_cast<float>(row) * (height + gap),
                                 width, height};
@@ -728,7 +733,7 @@ void VisualizerRenderer::drawPrecisionLevels(SDL_Renderer* renderer, const SDL_F
         const float y = rect.y + rect.h * (meter == 0 ? 0.32F : 0.67F);
         const float height = std::max(12.0F, rect.h * 0.16F);
         fill(renderer, {left, y, meterWidth, height}, {102, 123, 158, 38});
-        constexpr int segments = 42;
+        const int segments = detailCount(meterWidth, 9, 42);
         for (int segment = 0; segment < segments; ++segment) {
             const float t = static_cast<float>(segment) / static_cast<float>(segments - 1);
             if (t > values[static_cast<std::size_t>(meter)]) break;
@@ -748,7 +753,7 @@ void VisualizerRenderer::drawPrecisionLevels(SDL_Renderer* renderer, const SDL_F
 
 void VisualizerRenderer::drawCavaMonstercat(SDL_Renderer* renderer, const SDL_FRect& rect) const {
     base(renderer, rect);
-    const std::size_t count = static_cast<std::size_t>(std::clamp(rect.w / 13.0F, 24.0F, 58.0F));
+    const std::size_t count = detailCount(rect.w - 24, 16, 58);
     std::vector<float> levels(count);
     for (std::size_t i = 0; i < count; ++i) levels[i] = bandAt(gravityBands_, i, count);
     for (std::size_t source = 0; source < count; ++source) {
@@ -790,7 +795,7 @@ void VisualizerRenderer::drawCavaMonstercat(SDL_Renderer* renderer, const SDL_FR
 
 void VisualizerRenderer::drawPrismReflect(SDL_Renderer* renderer, const SDL_FRect& rect) const {
     base(renderer, rect);
-    const std::size_t count = static_cast<std::size_t>(std::clamp(rect.w / 10.0F, 32.0F, 64.0F));
+    const std::size_t count = detailCount(rect.w - 24, 14, 64);
     const float pad = std::max(8.0F, rect.w * 0.018F);
     const float gap = std::clamp(rect.w / 520.0F, 1.5F, 4.0F);
     const float width = (rect.w - pad * 2.0F - gap * static_cast<float>(count - 1)) /
@@ -823,17 +828,36 @@ void VisualizerRenderer::drawPrismReflect(SDL_Renderer* renderer, const SDL_FRec
     line(renderer, rect.x + pad, baseline, rect.x + rect.w - pad, baseline, {221, 241, 255, 92});
 }
 
-void VisualizerRenderer::drawPhosphorScope(SDL_Renderer* renderer, const SDL_FRect& rect) const {
-    fill(renderer, rect, {2, 12, 12, 255});
+void VisualizerRenderer::drawPhosphorScope(SDL_Renderer* renderer, const SDL_FRect& rect, bool retro) const {
+    const SDL_Color trace = retro ? SDL_Color{170, 230, 113, 255} : phosphor;
+    const SDL_Color bright = retro ? SDL_Color{208, 255, 161, 245} : SDL_Color{184, 255, 222, 245};
+    const SDL_Color grid = retro ? SDL_Color{106, 151, 86, 28} : SDL_Color{53, 144, 116, 28};
+    const SDL_Color axis = retro ? SDL_Color{170, 230, 113, 58} : SDL_Color{79, 203, 161, 58};
+    if (retro) {
+        // Match the green status displays, including their faint scanline texture.
+        constexpr SDL_FColor top{16 / 255.0F, 37 / 255.0F, 22 / 255.0F, 1};
+        constexpr SDL_FColor bottom{30 / 255.0F, 60 / 255.0F, 29 / 255.0F, 1};
+        const std::array<SDL_Vertex, 4> backdrop{{
+            {{rect.x, rect.y}, top, {}}, {{rect.x + rect.w, rect.y}, top, {}},
+            {{rect.x + rect.w, rect.y + rect.h}, bottom, {}},
+            {{rect.x, rect.y + rect.h}, bottom, {}}
+        }};
+        constexpr std::array indices{0, 1, 2, 0, 2, 3};
+        SDL_RenderGeometry(renderer, nullptr, backdrop.data(), 4, indices.data(), 6);
+        for (float y = rect.y + 3; y < rect.y + rect.h; y += 4)
+            line(renderer, rect.x, y, rect.x + rect.w, y, {0, 5, 0, 35});
+    } else {
+        fill(renderer, rect, {2, 12, 12, 255});
+    }
     for (int column = 0; column <= 10; ++column) {
         const float x = rect.x + rect.w * static_cast<float>(column) / 10.0F;
         line(renderer, x, rect.y, x, rect.y + rect.h,
-             column == 5 ? SDL_Color{79, 203, 161, 58} : SDL_Color{53, 144, 116, 28});
+             column == 5 ? axis : grid);
     }
     for (int row = 0; row <= 8; ++row) {
         const float y = rect.y + rect.h * static_cast<float>(row) / 8.0F;
         line(renderer, rect.x, y, rect.x + rect.w, y,
-             row == 4 ? SDL_Color{79, 203, 161, 58} : SDL_Color{53, 144, 116, 28});
+             row == 4 ? axis : grid);
     }
     for (std::size_t age = std::min(waveformCount_, waveformHistoryRows); age-- > 0;) {
         const auto source = (waveformHead_ + age) % waveformHistoryRows;
@@ -855,11 +879,12 @@ void VisualizerRenderer::drawPhosphorScope(SDL_Renderer* renderer, const SDL_FRe
             points.push_back({rect.x + position * rect.w,
                               rect.y + rect.h * 0.5F - sample * edge * rect.h * 0.43F});
         }
-        polyline(renderer, points, withAlpha(phosphor, static_cast<Uint8>(10.0F + fade * 42.0F)),
+        polyline(renderer, points, withAlpha(trace, static_cast<Uint8>(10.0F + fade * 42.0F)),
                  age == 0 ? 9 : 3);
-        if (age == 0) polyline(renderer, points, {184, 255, 222, 245}, 2);
+        if (age == 0) polyline(renderer, points, bright, 2);
     }
-    fill(renderer, {rect.x, rect.y, rect.w, 2.0F}, {148, 255, 219, 65});
+    fill(renderer, {rect.x, rect.y, rect.w, 2.0F}, retro
+         ? SDL_Color{170, 230, 113, 65} : SDL_Color{148, 255, 219, 65});
 }
 
 void VisualizerRenderer::drawLissajousPro(SDL_Renderer* renderer, const SDL_FRect& rect) const {
@@ -902,7 +927,7 @@ void VisualizerRenderer::drawRadialInferno(SDL_Renderer* renderer, const SDL_FRe
     const float cy = rect.y + rect.h * 0.5F;
     const float scale = std::min(rect.w, rect.h);
     const float inner = scale * (0.18F + beatPulse_ * 0.018F);
-    constexpr std::size_t segments = 72;
+    const std::size_t segments = detailCount(inner * pi * 2, 8, 72, 8);
     for (std::size_t i = 0; i < segments; ++i) {
         const float fraction = static_cast<float>(i) / static_cast<float>(segments);
         const float angle = fraction * pi * 2.0F - pi * 0.5F + rotation_ * 0.28F;
@@ -956,13 +981,16 @@ void VisualizerRenderer::drawCircularWave(SDL_Renderer* renderer, const SDL_FRec
 
 void VisualizerRenderer::drawSpectrogramMagma(SDL_Renderer* renderer, const SDL_FRect& rect) const {
     fill(renderer, rect, {3, 3, 12, 255});
-    const float rowHeight = rect.h / static_cast<float>(waterfallRows);
-    const float columnWidth = rect.w / static_cast<float>(AudioVisualizationFrame::bandCount);
-    for (std::size_t row = 0; row < waterfallRows; ++row) {
-        const auto source = (waterfallHead_ + row) % waterfallRows;
-        const float age = static_cast<float>(row) / static_cast<float>(waterfallRows - 1);
-        for (std::size_t band = 0; band < AudioVisualizationFrame::bandCount; ++band) {
-            const float raw = waterfall_[source][band];
+    const std::size_t columns = detailCount(rect.w, 6, AudioVisualizationFrame::bandCount);
+    const std::size_t rows = detailCount(rect.h, 4, waterfallRows);
+    const float rowHeight = rect.h / static_cast<float>(rows);
+    const float columnWidth = rect.w / static_cast<float>(columns);
+    for (std::size_t row = 0; row < rows; ++row) {
+        const float age = static_cast<float>(row) / static_cast<float>(rows - 1);
+        for (std::size_t band = 0; band < columns; ++band) {
+            float raw = 0;
+            for (auto sourceRow = row * waterfallRows / rows; sourceRow < (row + 1) * waterfallRows / rows; ++sourceRow)
+                raw = std::max(raw, bandAt(waterfall_[(waterfallHead_ + sourceRow) % waterfallRows], band, columns));
             const float intensity = std::clamp(std::pow(raw, 0.72F) * (1.0F - age * 0.28F), 0.0F, 1.0F);
             fill(renderer, {rect.x + static_cast<float>(band) * columnWidth,
                             rect.y + static_cast<float>(row) * rowHeight,
@@ -980,9 +1008,9 @@ void VisualizerRenderer::drawMilkdropMesh(SDL_Renderer* renderer, const SDL_FRec
     fill(renderer, rect, {3, 4, 17, 255});
     const float cx = rect.x + rect.w * 0.5F;
     const float cy = rect.y + rect.h * 0.48F;
-    constexpr int columns = 24;
-    constexpr int rows = 15;
-    std::array<std::array<SDL_FPoint, columns>, rows> mesh{};
+    const int columns = detailCount(rect.w, 24, 24);
+    const int rows = detailCount(rect.h, 22, 15);
+    std::array<std::array<SDL_FPoint, 24>, 15> mesh{};
     for (int row = 0; row < rows; ++row) {
         for (int column = 0; column < columns; ++column) {
             const float nx = static_cast<float>(column) / static_cast<float>(columns - 1) * 2.0F - 1.0F;
@@ -1000,7 +1028,7 @@ void VisualizerRenderer::drawMilkdropMesh(SDL_Renderer* renderer, const SDL_FRec
     }
     for (int row = 0; row < rows; ++row) {
         std::vector<SDL_FPoint> points(mesh[static_cast<std::size_t>(row)].begin(),
-                                      mesh[static_cast<std::size_t>(row)].end());
+                                      mesh[static_cast<std::size_t>(row)].begin() + columns);
         polyline(renderer, points, withAlpha(mix(blue, pink, static_cast<float>(row) /
                                                           static_cast<float>(rows - 1)), 70), 1);
     }
@@ -1027,7 +1055,7 @@ void VisualizerRenderer::drawParticleGalaxy(SDL_Renderer* renderer, const SDL_FR
     const float cx = rect.x + rect.w * 0.5F;
     const float cy = rect.y + rect.h * 0.5F;
     const float scale = std::min(rect.w, rect.h);
-    constexpr std::size_t particles = 120;
+    const std::size_t particles = detailCount(rect.w * rect.h * pixelsPerUnit_, 1600, 120, 8);
     constexpr float golden = 2.39996323F;
     for (std::size_t i = particles; i-- > 0;) {
         const float seed = static_cast<float>(i) / static_cast<float>(particles - 1);
@@ -1066,7 +1094,7 @@ void VisualizerRenderer::drawMasteringDashboard(SDL_Renderer* renderer, const SD
     for (const auto& panelRect : {scope, spectrum, phase, meters}) {
         fill(renderer, panelRect, {2, 5, 12, 255});
         color(renderer, {87, 117, 158, 68});
-        SDL_RenderRect(renderer, &panelRect);
+        drawing::outline(renderer, &panelRect);
     }
 
     for (int row = 1; row < 4; ++row) {
@@ -1084,7 +1112,7 @@ void VisualizerRenderer::drawMasteringDashboard(SDL_Renderer* renderer, const SD
     polyline(renderer, wave, withAlpha(phosphor, 24), 7);
     polyline(renderer, wave, withAlpha(phosphor, 225), 1);
 
-    constexpr std::size_t bars = 32;
+    const std::size_t bars = detailCount(spectrum.w, 12, 32);
     const float barWidth = spectrum.w / static_cast<float>(bars);
     for (std::size_t i = 0; i < bars; ++i) {
         const float level = bandAt(displayBands_, i, bars);
@@ -1112,7 +1140,7 @@ void VisualizerRenderer::drawMasteringDashboard(SDL_Renderer* renderer, const SD
     for (int channel = 0; channel < 2; ++channel) {
         const float x = meters.x + meters.w * (channel == 0 ? 0.18F : 0.56F);
         fill(renderer, {x, meters.y + 4.0F, meterWidth, meters.h - 8.0F}, {29, 39, 52, 255});
-        constexpr int segments = 24;
+        const int segments = detailCount(meters.h - 12, 8, 24);
         for (int segment = 0; segment < segments; ++segment) {
             const float t = static_cast<float>(segment) / static_cast<float>(segments - 1);
             const bool on = t <= levels[static_cast<std::size_t>(channel)];
@@ -1155,7 +1183,7 @@ void VisualizerRenderer::drawVintageFlatVu(SDL_Renderer* renderer, const SDL_FRe
         const SDL_FRect outer{outerX, rect.y + outerPad, meterWidth, rect.h - outerPad * 2.0F};
         fill(renderer, outer, {8, 9, 10, 255});
         color(renderer, {153, 157, 160, 125});
-        SDL_RenderRect(renderer, &outer);
+        drawing::outline(renderer, &outer);
 
         const float bevel = std::max(2.0F, std::min(outer.w, outer.h) * 0.012F);
         fill(renderer, {outer.x + bevel, outer.y + bevel, outer.w - bevel * 2.0F,
@@ -1177,7 +1205,7 @@ void VisualizerRenderer::drawVintageFlatVu(SDL_Renderer* renderer, const SDL_FRe
                   titlePixel, {35, 213, 132, 230});
 
         // Fourteen tapered blocks form the characteristic green/red flat scale.
-        constexpr int segments = 14;
+        const int segments = detailCount(face.w * 0.8F, 12, 14);
         const float scaleTop = face.y + face.h * 0.235F;
         const float scaleBottom = face.y + face.h * 0.385F;
         const float topLeft = face.x + face.w * 0.055F;
@@ -1191,7 +1219,7 @@ void VisualizerRenderer::drawVintageFlatVu(SDL_Renderer* renderer, const SDL_FRe
             const float x1Top = topLeft + (topRight - topLeft) * t1;
             const float x0Bottom = bottomLeft + (bottomRight - bottomLeft) * t0;
             const float x1Bottom = bottomLeft + (bottomRight - bottomLeft) * t1;
-            const SDL_Color zone = segment < 10
+            const SDL_Color zone = (static_cast<float>(segment) + 0.5F) / segments < 10.0F / 14.0F
                 ? mix(SDL_Color{20, 129, 80, 255}, SDL_Color{35, 213, 132, 255},
                       0.62F + static_cast<float>(segment % 2) * 0.12F)
                 : mix(SDL_Color{170, 37, 43, 255}, SDL_Color{238, 75, 75, 255},
@@ -1290,7 +1318,7 @@ void VisualizerRenderer::drawVintageFlatVu(SDL_Renderer* renderer, const SDL_FRe
         fill(renderer, {face.x, face.y, face.w, std::max(1.0F, face.h * 0.008F)},
              {255, 255, 255, 42});
         color(renderer, {146, 150, 151, 80});
-        SDL_RenderRect(renderer, &face);
+        drawing::outline(renderer, &face);
     }
 
     fill(renderer, {rect.x + rect.w * 0.5F - gap * 0.18F, rect.y + outerPad,
@@ -1314,7 +1342,7 @@ void VisualizerRenderer::drawOwLevelMeter(SDL_Renderer* renderer, const SDL_FRec
     const auto drawPanel = [&](const SDL_FRect& panelRect) {
         fill(renderer, panelRect, cardBackground);
         color(renderer, border);
-        SDL_RenderRect(renderer, &panelRect);
+        drawing::outline(renderer, &panelRect);
         fill(renderer, {panelRect.x + 1.0F, panelRect.y + 1.0F,
                         panelRect.w - 2.0F, 1.0F}, {255, 255, 255, 12});
     };
@@ -1339,7 +1367,7 @@ void VisualizerRenderer::drawOwLevelMeter(SDL_Renderer* renderer, const SDL_FRec
                                  card.w * 0.18F, card.h * 0.095F};
         fill(renderer, clipRect, clipping ? danger : elementBackground);
         color(renderer, clipping ? danger : border);
-        SDL_RenderRect(renderer, &clipRect);
+        drawing::outline(renderer, &clipRect);
         if (!compact || card.w > 300.0F) {
             pixelText(renderer, "CLIP", clipRect.x + clipRect.w * 0.5F,
                       clipRect.y + clipRect.h * 0.23F, labelPixel * 0.72F,
@@ -1359,7 +1387,7 @@ void VisualizerRenderer::drawOwLevelMeter(SDL_Renderer* renderer, const SDL_FRec
         };
         const std::array<float, 2> peaks{owPeakLeft_, owPeakRight_};
 
-        constexpr int slices = 60;
+        const int slices = detailCount(barHeight, 5, 60);
         for (std::size_t channel = 0; channel < 2; ++channel) {
             const float x = xPositions[channel];
             pixelText(renderer, channel == 0 ? "L" : "R", x + barWidth * 0.5F,
@@ -1383,7 +1411,7 @@ void VisualizerRenderer::drawOwLevelMeter(SDL_Renderer* renderer, const SDL_FRec
             }
             color(renderer, border);
             const SDL_FRect outline{x, barTop, barWidth, barHeight};
-            SDL_RenderRect(renderer, &outline);
+            drawing::outline(renderer, &outline);
         }
 
         static constexpr std::array<int, 7> dbMarks{0, -6, -12, -20, -30, -40, -60};
@@ -1447,7 +1475,7 @@ void VisualizerRenderer::drawOwLevelMeter(SDL_Renderer* renderer, const SDL_FRec
         const float x = plot.x + plot.w * static_cast<float>(column) / 4.0F;
         line(renderer, x, plot.y, x, plot.y + plot.h, withAlpha(border, 70));
     }
-    constexpr std::size_t spectrumBars = 48;
+    const std::size_t spectrumBars = detailCount(plot.w, 12, 48);
     const float barStep = plot.w / static_cast<float>(spectrumBars);
     std::size_t dominantBand{};
     float dominantLevel{};
@@ -1507,7 +1535,7 @@ void VisualizerRenderer::drawOwLevelMeter(SDL_Renderer* renderer, const SDL_FRec
                                   : loudnessLevels[channel] > 0.78F ? warning : success;
         fill(renderer, {track.x, track.y, track.w * loudnessLevels[channel], track.h}, zone);
         color(renderer, border);
-        SDL_RenderRect(renderer, &track);
+        drawing::outline(renderer, &track);
         pixelText(renderer, channel == 0 ? "L" : "R", loudness.x + loudness.w * 0.075F,
                   track.y, smallPixel * 0.62F, textMuted);
     }
@@ -1610,7 +1638,7 @@ void VisualizerRenderer::drawRackmountSpectrum(SDL_Renderer* renderer,
     fill(renderer, {panel.x, panel.y + panel.h - std::max(2.0F, panel.h * 0.018F),
                     panel.w, std::max(2.0F, panel.h * 0.018F)}, {0, 0, 0, 220});
     color(renderer, {1, 2, 3, 255});
-    SDL_RenderRect(renderer, &panel);
+    drawing::outline(renderer, &panel);
 
     const float earWidth = panel.w * (detailed ? 0.038F : 0.055F);
     const std::array<SDL_FRect, 2> ears{{
@@ -1719,8 +1747,8 @@ void VisualizerRenderer::drawRackmountSpectrum(SDL_Renderer* renderer,
                            glass.y + titleHeight,
                            glass.w * 0.964F,
                            glass.h - titleHeight - labelHeight};
-    const std::size_t bandCount = detailed ? 31U : (rect.w >= 300.0F ? 24U : 18U);
-    const int rowCount = detailed ? 18 : 16;
+    const std::size_t bandCount = detailCount(matrix.w, 14, 31);
+    const int rowCount = detailCount(matrix.h, 9, 18);
     const float bandStep = matrix.w / static_cast<float>(bandCount);
     const float rowStep = matrix.h / static_cast<float>(rowCount);
     const float ledWidth = std::max(1.0F, bandStep * 0.69F);
@@ -1792,7 +1820,7 @@ void VisualizerRenderer::drawRackmountSpectrum(SDL_Renderer* renderer,
                          {glass.x + glass.w * 0.25F, glass.y + glass.h * 0.72F}}},
              {255, 255, 255, 8});
     color(renderer, {71, 80, 84, 100});
-    SDL_RenderRect(renderer, &glass);
+    drawing::outline(renderer, &glass);
 
     const float statusCenterX = glass.x + glass.w + statusWidth * 0.54F;
     const float statusCenterY = panel.y + panel.h * 0.46F;
@@ -1814,7 +1842,7 @@ void VisualizerRenderer::drawRackmountSpectrum(SDL_Renderer* renderer,
                     std::max(1.0F, rocker.w - 2.0F), rocker.h * 0.42F},
          {50, 54, 56, 255});
     color(renderer, {76, 81, 83, 100});
-    SDL_RenderRect(renderer, &rocker);
+    drawing::outline(renderer, &rocker);
 }
 
 void VisualizerRenderer::drawGreenDbMeter(SDL_Renderer* renderer,
@@ -1843,8 +1871,8 @@ void VisualizerRenderer::drawGreenDbMeter(SDL_Renderer* renderer,
     const float graphTop = rect.y + rect.h * (detailed ? 0.105F : 0.075F);
     const float graphBottom = rect.y + rect.h * (detailed ? 0.765F : 0.745F);
     const float graphHeight = std::max(8.0F, graphBottom - graphTop);
-    constexpr std::size_t bandCount = 9;
-    constexpr int segmentCount = 14;
+    const std::size_t bandCount = detailCount(barsWidth, 24, 9);
+    const int segmentCount = detailCount(graphHeight, 12, 14);
     const float bandStep = barsWidth / static_cast<float>(bandCount);
     const float segmentStep = graphHeight / static_cast<float>(segmentCount);
     const float segmentWidth = bandStep * (detailed ? 0.68F : 0.72F);
@@ -1889,11 +1917,11 @@ void VisualizerRenderer::drawGreenDbMeter(SDL_Renderer* renderer,
                             std::max(1.0F, block.h * 0.18F)},
                  {190, 255, 194, static_cast<Uint8>(120 - heightPosition * 45.0F)});
             color(renderer, {161, 255, 174, 120});
-            SDL_RenderRect(renderer, &block);
+            drawing::outline(renderer, &block);
         }
     }
 
-    static constexpr std::array<std::string_view, bandCount> labels{
+    static constexpr std::array<std::string_view, 9> labels{
         "60", "120", "250", "500", "1K", "2K", "4K", "8K", "16K"
     };
     const float textPixel = std::clamp(
@@ -1904,7 +1932,9 @@ void VisualizerRenderer::drawGreenDbMeter(SDL_Renderer* renderer,
               rect.x + sidePad + legendWidth * 0.46F,
               labelTop, textPixel * (detailed ? 0.92F : 0.76F), labelColor);
     for (std::size_t band = 0; band < bandCount; ++band) {
-        pixelText(renderer, labels[band],
+        const auto labelIndex = static_cast<std::size_t>(std::lround(
+            static_cast<float>(band) * (labels.size() - 1) / (bandCount - 1)));
+        pixelText(renderer, labels[labelIndex],
                   barsLeft + (static_cast<float>(band) + 0.5F) * bandStep,
                   labelTop, textPixel, labelColor);
     }
@@ -1925,8 +1955,6 @@ void VisualizerRenderer::drawSpectrumSkyline(SDL_Renderer* renderer,
 
     fill(renderer, rect, {0, 1, 1, 255});
     const bool detailed = rect.w >= 760.0F && rect.h >= 300.0F;
-    const std::size_t barCount = detailed ? 36U : 28U;
-    const int segmentCount = detailed ? 20 : 16;
     const float sidePad = rect.w * (detailed ? 0.025F : 0.018F);
     const float graphTop = rect.y + rect.h * 0.055F;
     const float horizon = rect.y + rect.h * 0.735F;
@@ -1934,6 +1962,8 @@ void VisualizerRenderer::drawSpectrumSkyline(SDL_Renderer* renderer,
     const float floorBottom = rect.y + rect.h * 0.975F;
     const float floorHeight = floorBottom - horizon;
     const float usableWidth = rect.w - sidePad * 2.0F;
+    const std::size_t barCount = detailCount(usableWidth, 18, 36);
+    const int segmentCount = detailCount(graphHeight, 11, 20);
     const float barStep = usableWidth / static_cast<float>(barCount);
     const float barWidth = std::max(1.0F, barStep * 0.69F);
     const float segmentStep = graphHeight / static_cast<float>(segmentCount);
@@ -2051,12 +2081,12 @@ void VisualizerRenderer::drawNeonMosaic(SDL_Renderer* renderer,
 
     fill(renderer, rect, {0, 0, 1, 255});
     const bool detailed = rect.w >= 760.0F && rect.h >= 300.0F;
-    const std::size_t barCount = detailed ? 24U : 16U;
-    const int segmentCount = detailed ? 22 : 17;
     const float sidePad = rect.w * (detailed ? 0.012F : 0.016F);
     const float topPad = rect.h * 0.018F;
     const float bottom = rect.y + rect.h * 0.985F;
     const float graphHeight = bottom - (rect.y + topPad);
+    const std::size_t barCount = detailCount(rect.w - sidePad * 2, 24, 24);
+    const int segmentCount = detailCount(graphHeight, 12, 22);
     const float step = (rect.w - sidePad * 2.0F) / static_cast<float>(barCount);
     const float barWidth = std::max(1.0F, step * 0.68F);
     const float segmentStep = graphHeight / static_cast<float>(segmentCount);
@@ -2176,8 +2206,8 @@ void VisualizerRenderer::drawTripleSoundMeter(SDL_Renderer* renderer,
                                screenOuter.w * 0.87F,
                                screenOuter.h * 0.76F};
         fill(renderer, screen, {20, 24, 25, 255});
-        const std::size_t miniBars = detailed ? 14U : 10U;
-        constexpr int miniSegments = 8;
+        const std::size_t miniBars = detailCount(screen.w, 10, 14);
+        const int miniSegments = detailCount(screen.h, 7, 8);
         const float miniStep = screen.w / static_cast<float>(miniBars);
         const float miniWidth = miniStep * 0.68F;
         const float miniRowStep = screen.h / static_cast<float>(miniSegments);
@@ -2196,9 +2226,10 @@ void VisualizerRenderer::drawTripleSoundMeter(SDL_Renderer* renderer,
                 const float y = screen.y + screen.h - static_cast<float>(row + 1) *
                                 miniRowStep + (miniRowStep - miniHeight) * 0.5F;
                 const SDL_FRect led{x, y, miniWidth, miniHeight};
-                SDL_Color ledColor = row < 4 ? SDL_Color{42, 229, 70, 255}
-                                   : row < 6 ? SDL_Color{220, 241, 36, 255}
-                                   : row < 7 ? SDL_Color{255, 153, 25, 255}
+                const float heightPosition = static_cast<float>(row) / (miniSegments - 1);
+                SDL_Color ledColor = heightPosition < 0.5F ? SDL_Color{42, 229, 70, 255}
+                                   : heightPosition < 0.75F ? SDL_Color{220, 241, 36, 255}
+                                   : heightPosition < 0.875F ? SDL_Color{255, 153, 25, 255}
                                              : SDL_Color{255, 64, 30, 255};
                 if (row < activeRows) {
                     fill(renderer, {led.x - 1.0F, led.y - 1.0F,
@@ -2219,7 +2250,7 @@ void VisualizerRenderer::drawTripleSoundMeter(SDL_Renderer* renderer,
                              {screen.x + screen.w * 0.25F, screen.y + screen.h}}},
                  {255, 255, 255, 9});
         color(renderer, {100, 105, 108, 115});
-        SDL_RenderRect(renderer, &screenOuter);
+        drawing::outline(renderer, &screenOuter);
 
         // Deep machined bezel and dark radial meter face.
         const float gaugeRadius = std::min(columnWidth * (detailed ? 0.355F : 0.39F),
@@ -2250,7 +2281,7 @@ void VisualizerRenderer::drawTripleSoundMeter(SDL_Renderer* renderer,
         arc(renderer, gaugeX, gaugeY + gaugeRadius * 0.10F,
             gaugeRadius * 0.77F, startAngle, endAngle,
             {185, 189, 190, 115}, 1, 72);
-        constexpr int ticks = 18;
+        const int ticks = detailCount(gaugeRadius * 0.77F * (endAngle - startAngle), 8, 18, 3);
         const float scaleCenterY = gaugeY + gaugeRadius * 0.10F;
         const float labelPixel = std::clamp(gaugeRadius / 72.0F, 0.58F, 2.15F);
         for (int tick = 0; tick <= ticks; ++tick) {
@@ -2269,7 +2300,7 @@ void VisualizerRenderer::drawTripleSoundMeter(SDL_Renderer* renderer,
                  scaleCenterY + std::sin(angle) * outerRadius,
                  tickColor);
             if (major && (detailed || tick % 6 == 0)) {
-                pixelText(renderer, std::to_string(tick * 10),
+                pixelText(renderer, std::to_string(static_cast<int>(std::lround(t * 180))),
                           gaugeX + std::cos(angle) * gaugeRadius * 0.56F,
                           scaleCenterY + std::sin(angle) * gaugeRadius * 0.56F -
                               labelPixel * 3.5F,
@@ -2354,7 +2385,7 @@ void VisualizerRenderer::drawWarmTwinVu(SDL_Renderer* renderer,
     fill(renderer, {panel.x, panel.y + panel.h - std::max(2.0F, panel.h * 0.020F),
                     panel.w, std::max(2.0F, panel.h * 0.020F)}, {0, 0, 0, 230});
     color(renderer, {99, 101, 100, 125});
-    SDL_RenderRect(renderer, &panel);
+    drawing::outline(renderer, &panel);
 
     const float innerPad = panel.h * 0.060F;
     const float centerGap = panel.w * 0.012F;
@@ -2423,7 +2454,7 @@ void VisualizerRenderer::drawWarmTwinVu(SDL_Renderer* renderer,
             startAngle + (endAngle - startAngle) * 0.73F, endAngle,
             {188, 44, 34, 220}, 3, 32);
 
-        constexpr int ticks = 30;
+        const int ticks = detailCount(radius * (endAngle - startAngle), 7, 30, 4);
         for (int tick = 0; tick <= ticks; ++tick) {
             const float t = static_cast<float>(tick) / static_cast<float>(ticks);
             const float angle = startAngle + (endAngle - startAngle) * t;
@@ -2484,9 +2515,9 @@ void VisualizerRenderer::drawWarmTwinVu(SDL_Renderer* renderer,
                              {face.x + face.w * 0.25F, face.y + face.h * 0.73F}}},
                  {255, 255, 255, 18});
         color(renderer, {74, 58, 39, 165});
-        SDL_RenderRect(renderer, &face);
+        drawing::outline(renderer, &face);
         color(renderer, {121, 109, 89, 115});
-        SDL_RenderRect(renderer, &bezel);
+        drawing::outline(renderer, &bezel);
     }
 
     fill(renderer, {panel.x + panel.w * 0.5F - centerGap * 0.18F,

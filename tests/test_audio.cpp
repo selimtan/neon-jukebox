@@ -11,6 +11,7 @@
 
 #include "neon/Audio.hpp"
 #include "neon/Models.hpp"
+#include "neon/Utils.hpp"
 
 namespace {
 
@@ -53,6 +54,75 @@ neon::AudioVisualizationFrame analyzedSine(float amplitude) {
     return analyzer.frame();
 }
 
+float effectPeak(float volume) {
+    neon::AudioEngine audio;
+    std::string error;
+    CHECK(audio.initialize(error, NEON_EFFECT_FIXTURES));
+    CHECK(audio.takeEffectError().empty());
+    CHECK(!audio.playEffect(neon::UiSoundEffect::Coin)); // Neon/default is silent.
+    audio.setEffectsEnabled(true);
+    audio.setVolume(volume);
+    CHECK(audio.playEffect(neon::UiSoundEffect::Coin));
+    float peak{};
+    for (int frame = 0; frame < 85; ++frame) {
+        SDL_Delay(10);
+        const auto frameData = audio.visualization();
+        // Measure PCM samples; the visual peak meter intentionally boosts RMS.
+        for (const auto sample : frameData.leftWaveform) peak = std::max(peak, std::abs(sample));
+    }
+    CHECK(!audio.playing());
+    CHECK(!audio.takeFinished()); // An effect ending is never a song completion.
+    return peak;
+}
+
+void verifyEffects() {
+    const auto loud = effectPeak(1.0F);
+    const auto quiet = effectPeak(0.25F);
+    std::cout << "Effect output peaks: full=" << loud << " quarter=" << quiet << '\n';
+    CHECK(loud > 0.20F && loud < 0.48F); // 35% gain, allowing sample-rate conversion overshoot.
+    CHECK(quiet > loud * 0.18F && quiet < loud * 0.32F);
+    CHECK(effectPeak(0.0F) == 0.0F);
+
+    const auto root = std::filesystem::temp_directory_path() / ("neon-effects-" + neon::randomId());
+    std::filesystem::create_directories(root);
+    for (const auto* name : {"coin.wav", "page-turn.wav"})
+        std::filesystem::copy_file(std::filesystem::path(NEON_EFFECT_FIXTURES) / name, root / name);
+    {
+        neon::AudioEngine audio;
+        std::string error;
+        CHECK(audio.initialize(error, root));
+        CHECK(audio.takeEffectError().empty());
+        audio.setEffectsEnabled(true);
+        // Removing the source proves effects have been decoded before clicks.
+        for (const auto* name : {"coin.wav", "page-turn.wav"}) CHECK(std::filesystem::remove(root / name));
+        CHECK(audio.play(fixture(std::filesystem::path(NEON_MIXER_FIXTURES) / "music.mp3"), 0, error));
+        CHECK(audio.pause());
+        const auto position = audio.positionMs();
+        const auto duration = audio.durationMs();
+        for (int i = 0; i < 20; ++i) CHECK(audio.playEffect(neon::UiSoundEffect::Coin));
+        CHECK(audio.playEffect(neon::UiSoundEffect::PageTurn));
+        SDL_Delay(160);
+        CHECK(audio.visualization().peakLeft > 0.01F);
+        CHECK(audio.paused());
+        CHECK(audio.positionMs() == position);
+        CHECK(audio.durationMs() == duration);
+        CHECK(!audio.takeFinished());
+        CHECK(audio.resume());
+        audio.setEffectsEnabled(false);
+        CHECK(!audio.playEffect(neon::UiSoundEffect::PageTurn));
+        CHECK(audio.playing());
+        audio.shutdown();
+        // Missing files remain a nonfatal, once-readable warning after recovery.
+        CHECK(audio.initialize(error, root));
+        CHECK(!audio.takeEffectError().empty());
+        CHECK(audio.takeEffectError().empty());
+        audio.setEffectsEnabled(true);
+        CHECK(!audio.playEffect(neon::UiSoundEffect::Coin));
+        CHECK(audio.play(fixture(std::filesystem::path(NEON_MIXER_FIXTURES) / "music.mp3"), 0, error));
+    }
+    std::filesystem::remove(root);
+}
+
 }  // namespace
 
 int main() {
@@ -71,6 +141,7 @@ int main() {
     CHECK(loudMaximum > 0.70F);
     CHECK(std::ranges::count_if(loudTone.bands,
         [](float value) { return value > 0.95F; }) < 12);
+    verifyEffects();
 
     {
         neon::AudioEngine audio;

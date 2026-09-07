@@ -18,13 +18,17 @@ public:
                                             float, SDL_Color)>;
 
     void update(const AudioVisualizationFrame& frame, std::uint64_t ticks);
-    void draw(SDL_Renderer* renderer, const SDL_FRect& rect, VisualizerMode mode) const;
+    void draw(SDL_Renderer* renderer, const SDL_FRect& rect, VisualizerMode mode,
+              float pixelsPerUnit = 1.0F);
     void setTextRenderer(TextRenderer renderer);
 
     [[nodiscard]] static std::string_view name(VisualizerMode mode);
     [[nodiscard]] static std::string_view subtitle(VisualizerMode mode);
 
 private:
+    [[nodiscard]] int detailCount(float span, float minimumPixelPitch, int maximum,
+                                  int minimum = 2) const;
+    float pixelsPerUnit_{1.0F};
     static constexpr std::size_t waterfallRows = 72;
     static constexpr std::size_t waveformHistoryRows = 10;
 
@@ -40,7 +44,7 @@ private:
     void drawPrecisionLevels(SDL_Renderer* renderer, const SDL_FRect& rect) const;
     void drawCavaMonstercat(SDL_Renderer* renderer, const SDL_FRect& rect) const;
     void drawPrismReflect(SDL_Renderer* renderer, const SDL_FRect& rect) const;
-    void drawPhosphorScope(SDL_Renderer* renderer, const SDL_FRect& rect) const;
+    void drawPhosphorScope(SDL_Renderer* renderer, const SDL_FRect& rect, bool retro = false) const;
     void drawLissajousPro(SDL_Renderer* renderer, const SDL_FRect& rect) const;
     void drawRadialInferno(SDL_Renderer* renderer, const SDL_FRect& rect) const;
     void drawCircularWave(SDL_Renderer* renderer, const SDL_FRect& rect) const;

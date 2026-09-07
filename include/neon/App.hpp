@@ -15,6 +15,7 @@
 #include <SDL3/SDL.h>
 
 #include "neon/Audio.hpp"
+#include "neon/ArtworkPreparation.hpp"
 #include "neon/Library.hpp"
 #include "neon/OnlineArtwork.hpp"
 #include "neon/Queue.hpp"
@@ -35,20 +36,27 @@ public:
     int run();
 
 private:
+    friend struct AppScanTest;
+
     bool initialize(std::string& error);
     void shutdown();
     void handleEvent(SDL_Event& event);
     void dispatch(const UiAction& action);
     void update();
     void render();
+    void requestPage(std::size_t page);
+    void finishPendingPage();
     void updateFilter(bool resetPage = true);
+    void selectLibraryMedia(MediaKind kind);
+    void focusLibraryTrack(std::size_t libraryIndex);
     void rebuildGenres();
-    void processScanTrackUpdates();
+    bool processScanTrackUpdates();
     void startScan(std::vector<std::filesystem::path> musicRoots,
                    std::vector<std::filesystem::path> videoRoots);
     void processScan();
     void startArtworkFetch();
     void processArtworkFetch();
+    void prepareLibraryArtwork(std::span<const Track> tracks);
     void showFolderDialog(MediaKind mediaKind, bool setup);
     void processFolderResult();
     void recoverAudio();
@@ -56,6 +64,9 @@ private:
     void stopPlayback();
     [[nodiscard]] bool currentIsVideo() const;
     void startNextTrack();
+    const Track* nextAmbientTrack();
+    void prepareNextAmbientVideo();
+    bool fullscreenVideoInfoVisible(std::uint64_t ticks);
     void skipCurrent();
     void persistPlayback();
     void setToast(std::string message, std::uint64_t durationMs = 2800);
@@ -74,6 +85,8 @@ private:
     UI ui_;
     AudioEngine audio_;
     VideoEngine video_;
+    LibraryArtworkPreparer artworkPreparer_;
+    bool artworkPreparationStopped_{};
     std::unique_ptr<Storage> storage_;
     Settings settings_;
     LibraryIndex library_;
@@ -83,22 +96,26 @@ private:
     std::vector<std::size_t> filtered_;
     std::optional<std::size_t> selectedIndex_;
     std::string currentTrackId_;
+    std::optional<Track> nextAmbientVideo_;
     bool currentIsManual_{};
     std::string search_;
     std::string searchDraft_;
     std::vector<std::string> genres_;
     std::string selectedGenre_;
+    char selectedArtistInitial_{};
     bool genreMenuOpen_{};
     std::size_t genreMenuPage_{};
     LibraryFilter libraryFilter_{LibraryFilter::All};
     bool keyboardOpen_{};
     bool visualizerOpen_{};
     bool videoFullscreen_{};
+    std::optional<std::uint64_t> videoInfoStartedAt_;
     bool visualizerPointerDown_{};
     float visualizerPointerStartX_{};
     bool playNowPrompt_{};
     std::string requestedTrackTitle_;
     std::size_t page_{};
+    std::optional<std::size_t> pendingPage_;
     UiMode mode_{UiMode::SetupPin};
     std::string pinInput_;
     std::string firstPin_;
@@ -114,6 +131,11 @@ private:
     std::vector<Track> scanTrackUpdates_;
     bool scanCacheDirty_{};
     bool scanning_{};
+    struct ScanRequest {
+        std::vector<std::filesystem::path> musicRoots;
+        std::vector<std::filesystem::path> videoRoots;
+    };
+    std::optional<ScanRequest> pendingScan_;
 
     std::future<void> artworkFuture_;
     std::atomic_bool artworkCancel_{};
@@ -126,6 +148,7 @@ private:
     std::mutex folderMutex_;
     std::vector<std::filesystem::path> pendingFolders_;
     bool folderResultReady_{};
+    bool folderDialogOpen_{};
     bool folderForSetup_{};
     MediaKind folderMediaKind_{MediaKind::Music};
 

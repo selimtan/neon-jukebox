@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "neon/Utils.hpp"
 
@@ -130,6 +131,14 @@ void AudioEngine::shutdown() {
     acceptFinished_.store(false, std::memory_order_release);
     if (track_) MIX_DestroyTrack(track_);
     if (audio_) MIX_DestroyAudio(audio_);
+    for (auto*& voice : effectTracks_) {
+        if (voice) MIX_DestroyTrack(voice);
+        voice = nullptr;
+    }
+    for (auto*& sound : effectAudio_) {
+        if (sound) MIX_DestroyAudio(sound);
+        sound = nullptr;
+    }
     if (mixer_) MIX_DestroyMixer(mixer_);
     track_ = nullptr;
     audio_ = nullptr;
@@ -137,10 +146,12 @@ void AudioEngine::shutdown() {
     finished_.store(false, std::memory_order_release);
     paused_ = false;
     durationMs_ = 0;
+    nextCoinVoice_ = 0;
+    effectError_.clear();
     if (wasInitialized) MIX_Quit();
 }
 
-bool AudioEngine::initialize(std::string& error) {
+bool AudioEngine::initialize(std::string& error, const std::filesystem::path& effectsDirectory) {
     if (mixer_) return true;
     if (!MIX_Init()) {
         error = SDL_GetError();
@@ -164,8 +175,48 @@ bool AudioEngine::initialize(std::string& error) {
         return false;
     }
     setVolume(volume_);
+    const auto directory = effectsDirectory.empty()
+        ? pathFromUtf8(SDL_GetBasePath()) / L"assets" / L"sounds" / L"retro"
+        : effectsDirectory;
+    constexpr std::array names{"coin.wav", "page-turn.wav"};
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        // Predecode the small WAVs once. Missing effects do not disable music.
+        effectAudio_[i] = MIX_LoadAudio(mixer_, pathToUtf8(directory / names[i]).c_str(), true);
+        if (!effectAudio_[i]) effectError_ += std::string(names[i]) + ": " + SDL_GetError() + "\n";
+    }
+    for (auto*& voice : effectTracks_) {
+        voice = MIX_CreateTrack(mixer_);
+        if (!voice || !MIX_SetTrackGain(voice, 0.35F)) {
+            effectError_ += std::string("Effect channel: ") + SDL_GetError() + "\n";
+            if (voice) MIX_DestroyTrack(voice);
+            voice = nullptr;
+        }
+    }
     return true;
 }
+
+void AudioEngine::setEffectsEnabled(bool enabled) {
+    if (effectsEnabled_ == enabled) return;
+    effectsEnabled_ = enabled;
+    if (!enabled) for (auto* voice : effectTracks_) if (voice) MIX_StopTrack(voice, 0);
+}
+
+bool AudioEngine::playEffect(UiSoundEffect effect) {
+    if (!effectsEnabled_ || !mixer_) return false;
+    const auto index = static_cast<std::size_t>(effect);
+    if (index >= effectAudio_.size() || !effectAudio_[index]) return false;
+    const auto slot = effect == UiSoundEffect::Coin ? nextCoinVoice_++ % 3 : 3;
+    auto* voice = effectTracks_[slot];
+    if (!voice) return false;
+    // Reuse a bounded pool; effects never touch the music track or its callback.
+    if (!MIX_SetTrackAudio(voice, effectAudio_[index]) || !MIX_PlayTrack(voice, 0)) {
+        if (effectError_.empty()) effectError_ = std::string("Effect playback: ") + SDL_GetError();
+        return false;
+    }
+    return true;
+}
+
+std::string AudioEngine::takeEffectError() { return std::exchange(effectError_, {}); }
 
 bool AudioEngine::play(const Track& selected, std::int64_t startMs, std::string& error) {
     if (!mixer_ && !initialize(error)) return false;

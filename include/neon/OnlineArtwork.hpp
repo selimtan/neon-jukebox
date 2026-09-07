@@ -11,6 +11,7 @@
 #include "neon/Models.hpp"
 
 namespace neon {
+std::string onlineArtworkCacheKey(const Track& track);
 
 struct OnlineArtworkProgress {
     std::size_t discovered{};

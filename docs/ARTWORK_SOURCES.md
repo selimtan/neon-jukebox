@@ -25,9 +25,11 @@ image is downloaded:
   case-insensitive, accent-insensitive, and tolerant of common edition suffixes.
 - The background worker continues after a provider miss, malformed response,
   rejected candidate, invalid image, HTTP failure, or download failure.
-- A temporary failure is retried up to three times and is not written to the
-  negative cache. Only a completed pass in which every provider misses is
-  cached for 14 days.
+- A temporary failure is retried up to three times within its initial lookup.
+  Completed results, partial metadata and misses are persisted per source file
+  version in `library/artwork/metadata.json` beside the EXE. Restarting or changing
+  display metadata reuses them. Changing the source file permits a fresh lookup.
+  Legacy provider-level misses retain their original 14-day cache during migration.
 - The negative-cache namespace is versioned. Changing the provider strategy can
   invalidate old misses without deleting successful artwork.
 - Provider-specific pacing stays below documented public request limits where a

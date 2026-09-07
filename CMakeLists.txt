@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(NeonJukebox VERSION 1.0.0 LANGUAGES C CXX)
+project(NeonJukebox VERSION 1.0.1 LANGUAGES C CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -116,7 +116,10 @@ add_library(neon_core
     src/Queue.cpp
     src/Security.cpp
     src/Storage.cpp
+    src/SingleInstance.cpp
     src/Library.cpp
+    src/HttpRequest.cpp
+    src/VideoSourceCache.cpp
     src/OnlineArtwork.cpp)
 target_include_directories(neon_core PUBLIC include)
 target_include_directories(neon_core SYSTEM PUBLIC
@@ -129,7 +132,7 @@ target_include_directories(neon_core SYSTEM PUBLIC
     ${taglib_SOURCE_DIR}/taglib/flac
     ${taglib_BINARY_DIR})
 target_compile_definitions(neon_core PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
-target_link_libraries(neon_core PUBLIC tag nlohmann_json::nlohmann_json bcrypt winhttp)
+target_link_libraries(neon_core PUBLIC tag nlohmann_json::nlohmann_json bcrypt winhttp user32)
 if(MSVC)
     target_compile_options(neon_core PRIVATE /W4 /permissive- /utf-8)
 endif()
@@ -140,8 +143,16 @@ add_executable(neon_jukebox WIN32
     src/Audio.cpp
     src/Video.cpp
     src/UI.cpp
+    src/UIRetro.cpp
     src/Visualizer.cpp
+    src/VideoThumbnail.cpp
+    src/ArtworkPreparation.cpp
     src/Artwork.cpp)
+add_custom_target(neon_runtime_assets ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:neon_jukebox>/assets"
+    COMMENT "Copying Jukebox runtime assets")
+add_dependencies(neon_jukebox neon_runtime_assets)
 if(WIN32)
     target_sources(neon_jukebox PRIVATE assets/windows/neon_jukebox.rc)
 endif()
@@ -153,23 +164,82 @@ target_link_libraries(neon_jukebox PRIVATE
     SDL3_mixer::SDL3_mixer-static
     SDL3_image::SDL3_image-static
     SDL3_ttf::SDL3_ttf-static
-    mfplay mfplat mfuuid propsys ole32 oleaut32 uuid)
+    mfplay mfplat mfreadwrite mfuuid propsys ole32 oleaut32 uuid shell32 gdi32)
 if(MSVC)
     target_compile_options(neon_jukebox PRIVATE /W4 /permissive- /utf-8)
     target_link_options(neon_jukebox PRIVATE /SUBSYSTEM:WINDOWS)
 endif()
 
+add_executable(neon_recorder WIN32
+    src/recorder_main.cpp
+    src/Recorder.cpp
+    src/MediaSession.cpp)
+if(WIN32)
+    target_sources(neon_recorder PRIVATE assets/windows/neon_recorder.rc)
+endif()
+target_include_directories(neon_recorder PRIVATE include)
+target_compile_definitions(neon_recorder PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+target_link_libraries(neon_recorder PRIVATE
+    ole32 uuid avrt comctl32 shell32 dwmapi uxtheme advapi32
+    mf mfplat mfreadwrite mfuuid windowscodecs windowsapp)
+if(MSVC)
+    target_compile_options(neon_recorder PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(neon_recorder PRIVATE /SUBSYSTEM:WINDOWS)
+endif()
+
 if(NEON_BUILD_TESTING)
+    add_executable(neon_single_instance_tests tests/test_single_instance.cpp src/SingleInstance.cpp)
+    target_include_directories(neon_single_instance_tests PRIVATE include)
+    target_compile_definitions(neon_single_instance_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_link_libraries(neon_single_instance_tests PRIVATE user32)
+    if(MSVC)
+        target_compile_options(neon_single_instance_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_single_instance_tests COMMAND neon_single_instance_tests)
+    set_tests_properties(neon_single_instance_tests PROPERTIES TIMEOUT 45)
+
+    add_executable(neon_scan_tests tests/test_scan.cpp
+        src/App.cpp src/Audio.cpp src/Video.cpp src/UI.cpp src/UIRetro.cpp
+        src/Visualizer.cpp src/Artwork.cpp src/VideoThumbnail.cpp src/ArtworkPreparation.cpp)
+    target_include_directories(neon_scan_tests PRIVATE include)
+    target_compile_definitions(neon_scan_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+        NEON_MIXER_FIXTURES="${sdl3_mixer_SOURCE_DIR}/examples"
+        NEON_EFFECT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/retro")
+    target_link_libraries(neon_scan_tests PRIVATE neon_core SDL3::SDL3-static
+        SDL3_mixer::SDL3_mixer-static SDL3_image::SDL3_image-static SDL3_ttf::SDL3_ttf-static
+        mfplay mfplat mfreadwrite mfuuid propsys ole32 oleaut32 uuid shell32 gdi32)
+    if(MSVC)
+        target_compile_options(neon_scan_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_incremental_scan_tests COMMAND neon_scan_tests)
+    set_tests_properties(neon_incremental_scan_tests PROPERTIES ENVIRONMENT "SDL_AUDIODRIVER=dummy")
+
+    add_executable(neon_ui_tests tests/test_ui.cpp src/UI.cpp src/UIRetro.cpp src/Artwork.cpp src/Visualizer.cpp src/VideoThumbnail.cpp src/ArtworkPreparation.cpp)
+    target_include_directories(neon_ui_tests PRIVATE include)
+    target_compile_definitions(neon_ui_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_link_libraries(neon_ui_tests PRIVATE neon_core SDL3::SDL3-static
+        SDL3_mixer::SDL3_mixer-static SDL3_image::SDL3_image-static SDL3_ttf::SDL3_ttf-static shell32 gdi32 ole32 mfplat mfreadwrite mfuuid)
+    if(MSVC)
+        target_compile_options(neon_ui_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_ui_theme_tests COMMAND neon_ui_tests)
+    set_tests_properties(neon_ui_theme_tests PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+
     add_executable(neon_tests tests/test_core.cpp)
     target_link_libraries(neon_tests PRIVATE neon_core)
     target_compile_definitions(neon_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     add_test(NAME neon_core_tests COMMAND neon_tests)
+    add_executable(neon_shutdown_io_tests tests/test_shutdown_io.cpp)
+    target_link_libraries(neon_shutdown_io_tests PRIVATE neon_core ws2_32)
+    add_test(NAME neon_shutdown_io_tests COMMAND neon_shutdown_io_tests)
+    set_tests_properties(neon_shutdown_io_tests PROPERTIES TIMEOUT 45)
 
     add_executable(neon_audio_tests tests/test_audio.cpp src/Audio.cpp)
     target_include_directories(neon_audio_tests PRIVATE include)
     target_compile_definitions(neon_audio_tests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
         NEON_MIXER_FIXTURES="${sdl3_mixer_SOURCE_DIR}/examples"
+        NEON_EFFECT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/retro"
         NEON_TAGLIB_FIXTURES="${taglib_SOURCE_DIR}/tests/data")
     target_link_libraries(neon_audio_tests PRIVATE
         neon_core SDL3::SDL3-static SDL3_mixer::SDL3_mixer-static)
@@ -197,7 +267,8 @@ if(NEON_BUILD_TESTING)
     add_executable(neon_video_tests tests/test_video.cpp src/Video.cpp src/Audio.cpp)
     target_include_directories(neon_video_tests PRIVATE include)
     target_compile_definitions(neon_video_tests PRIVATE
-        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
+        NEON_EFFECT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/retro")
     target_link_libraries(neon_video_tests PRIVATE
         neon_core SDL3::SDL3-static SDL3_mixer::SDL3_mixer-static nlohmann_json::nlohmann_json
         mfplay mfplat mfuuid propsys ole32 oleaut32 uuid)
@@ -205,12 +276,41 @@ if(NEON_BUILD_TESTING)
         target_compile_options(neon_video_tests PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME neon_video_integration_tests COMMAND neon_video_tests)
+
+    add_executable(neon_recorder_tests tests/test_recorder.cpp src/Recorder.cpp)
+    target_include_directories(neon_recorder_tests PRIVATE include)
+    target_include_directories(neon_recorder_tests SYSTEM PRIVATE
+        ${taglib_SOURCE_DIR}
+        ${taglib_SOURCE_DIR}/taglib
+        ${taglib_SOURCE_DIR}/taglib/toolkit
+        ${taglib_BINARY_DIR})
+    target_compile_definitions(neon_recorder_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_link_libraries(neon_recorder_tests PRIVATE
+        tag ole32 uuid avrt mf mfplat mfreadwrite mfuuid propsys shell32)
+    if(MSVC)
+        target_compile_options(neon_recorder_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_recorder_file_tests COMMAND neon_recorder_tests)
+
+    add_executable(neon_media_session_tests
+        tests/test_media_session.cpp
+        src/MediaSession.cpp)
+    target_include_directories(neon_media_session_tests PRIVATE include)
+    target_compile_definitions(neon_media_session_tests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+    target_link_libraries(neon_media_session_tests PRIVATE ole32 windowscodecs windowsapp)
+    if(MSVC)
+        target_compile_options(neon_media_session_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_media_session_source_tests COMMAND neon_media_session_tests)
 endif()
 
-install(TARGETS neon_jukebox RUNTIME DESTINATION . COMPONENT Application)
-install(DIRECTORY assets/ DESTINATION assets COMPONENT Application)
+install(TARGETS neon_jukebox neon_recorder RUNTIME DESTINATION . COMPONENT Application)
+install(DIRECTORY assets/ DESTINATION assets COMPONENT Application
+        PATTERN "DSEG*" EXCLUDE)
 install(FILES README.md LICENSE THIRD_PARTY_NOTICES.md DESTINATION . COMPONENT Application)
-install(FILES docs/VISUALIZER_RESEARCH.md docs/ARTWORK_SOURCES.md DESTINATION docs COMPONENT Application)
+install(FILES docs/VISUALIZER_RESEARCH.md docs/ARTWORK_SOURCES.md docs/THEMES.md DESTINATION docs COMPONENT Application)
 install(FILES "${sdl3_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses
         RENAME SDL3-LICENSE.txt COMPONENT Application)
 install(FILES "${sdl3_mixer_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses

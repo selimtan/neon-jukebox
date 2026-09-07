@@ -15,6 +15,7 @@ std::wstring fromUtf8(std::string_view value);
 std::string pathToUtf8(const std::filesystem::path& path);
 std::filesystem::path pathFromUtf8(std::string_view value);
 std::string normalizeForSearch(std::string_view value);
+std::string uppercaseForDisplay(std::string_view value);
 std::string makeStableId(std::string_view value);
 std::string randomId();
 std::string hexEncode(std::span<const std::uint8_t> bytes);

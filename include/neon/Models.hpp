@@ -1,12 +1,16 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json_fwd.hpp>
+
+#include "neon/Theme.hpp"
 
 namespace neon {
 
@@ -44,9 +48,37 @@ enum class VisualizerMode {
     SpectrumSkyline,
     NeonMosaic,
     TripleSoundMeter,
-    WarmTwinVu
+    WarmTwinVu,
+    RetroPhosphorScope
 };
-inline constexpr std::size_t visualizerModeCount = 28;
+inline constexpr std::size_t visualizerModeCount = 29;
+inline constexpr auto neonVisualizerModes = [] {
+    std::array<VisualizerMode, 28> modes{};
+    for (std::size_t i = 0; i < modes.size(); ++i) modes[i] = static_cast<VisualizerMode>(i);
+    return modes;
+}();
+inline constexpr std::array retroVisualizerModes{VisualizerMode::RetroPhosphorScope};
+
+constexpr std::span<const VisualizerMode> visualizersForTheme(Theme theme) {
+    if (theme == Theme::Retro) return retroVisualizerModes;
+    return neonVisualizerModes;
+}
+
+constexpr std::size_t themeVisualizerIndex(Theme theme, VisualizerMode mode) {
+    const auto modes = visualizersForTheme(theme);
+    for (std::size_t i = 0; i < modes.size(); ++i) if (modes[i] == mode) return i;
+    return 0;
+}
+
+constexpr VisualizerMode themeVisualizer(Theme theme, VisualizerMode mode) {
+    return visualizersForTheme(theme)[themeVisualizerIndex(theme, mode)];
+}
+
+constexpr VisualizerMode adjacentVisualizer(Theme theme, VisualizerMode mode, bool forward) {
+    const auto modes = visualizersForTheme(theme);
+    const auto current = themeVisualizerIndex(theme, mode);
+    return modes[(current + (forward ? 1 : modes.size() - 1)) % modes.size()];
+}
 
 struct Track {
     std::string id;
@@ -83,17 +115,20 @@ struct PinRecord {
 
 struct Settings {
     int schemaVersion{5};
+    Theme theme{Theme::Neon};
     std::vector<std::filesystem::path> musicRoots;
     std::vector<std::filesystem::path> videoRoots;
     PinRecord adminPin;
     float volume{0.8F};
     AmbientMode ambientMode{AmbientMode::Shuffle};
     bool ambientRepeat{true};
+    std::optional<MediaKind> ambientMediaKind;
     std::int64_t playbackPositionMs{};
     std::string currentTrackId;
     bool playbackWasActive{};
     bool currentTrackManual{};
     VisualizerMode visualizerMode{VisualizerMode::AuroraSpectrum};
+    VisualizerMode retroVisualizerMode{VisualizerMode::RetroPhosphorScope};
     NowPlayingArtworkMode nowPlayingArtworkMode{NowPlayingArtworkMode::Artwork};
 };
 

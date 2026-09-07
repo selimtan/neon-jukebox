@@ -19,6 +19,8 @@
 #include <nlohmann/json.hpp>
 
 #include "neon/Utils.hpp"
+#include "neon/HttpRequest.hpp"
+#include "neon/BackgroundIo.hpp"
 
 namespace neon {
 namespace {
@@ -41,11 +43,7 @@ private:
     HINTERNET value_{};
 };
 
-struct HttpResponse {
-    bool received{};
-    DWORD status{};
-    std::vector<std::uint8_t> body;
-};
+using detail::HttpResponse;
 
 struct AlbumGroup {
     std::string cacheKey;
@@ -336,57 +334,7 @@ void waitForProvider(ProviderThrottle& provider, const std::atomic_bool* cancel)
     provider.lastRequest = std::chrono::steady_clock::now();
 }
 
-HttpResponse httpGet(HINTERNET session, std::string_view url, std::wstring_view accept,
-                     std::size_t maximumBytes, const std::atomic_bool* cancel) {
-    HttpResponse response;
-    if (!session || cancelled(cancel)) return response;
-    const std::wstring wideUrl = fromUtf8(url);
-    URL_COMPONENTS components{};
-    components.dwStructSize = sizeof(components);
-    components.dwHostNameLength = static_cast<DWORD>(-1);
-    components.dwUrlPathLength = static_cast<DWORD>(-1);
-    components.dwExtraInfoLength = static_cast<DWORD>(-1);
-    if (!WinHttpCrackUrl(wideUrl.c_str(), static_cast<DWORD>(wideUrl.size()), 0, &components)) return response;
-
-    const std::wstring host(components.lpszHostName, components.dwHostNameLength);
-    std::wstring resource(components.lpszUrlPath, components.dwUrlPathLength);
-    if (components.dwExtraInfoLength > 0) resource.append(components.lpszExtraInfo, components.dwExtraInfoLength);
-    InternetHandle connection(WinHttpConnect(session, host.c_str(), components.nPort, 0));
-    if (!connection) return response;
-    const DWORD flags = components.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-    InternetHandle request(WinHttpOpenRequest(connection.get(), L"GET", resource.c_str(), nullptr,
-                                               WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
-    if (!request) return response;
-
-    const std::wstring headers = L"Accept: " + std::wstring(accept) + L"\r\n";
-    if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(request.get(), nullptr)) return response;
-    response.received = true;
-    DWORD statusBytes = sizeof(response.status);
-    WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &response.status, &statusBytes,
-                        WINHTTP_NO_HEADER_INDEX);
-    if (response.status != 200) return response;
-
-    std::array<std::uint8_t, 16 * 1024> buffer{};
-    while (!cancelled(cancel)) {
-        DWORD read{};
-        if (!WinHttpReadData(request.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
-            response.received = false;
-            response.body.clear();
-            return response;
-        }
-        if (read == 0) break;
-        if (response.body.size() + read > maximumBytes) {
-            response.received = false;
-            response.body.clear();
-            return response;
-        }
-        response.body.insert(response.body.end(), buffer.begin(), buffer.begin() + read);
-    }
-    return response;
-}
+using detail::httpGet;
 
 bool validImage(std::span<const std::uint8_t> data) {
     const bool jpeg = data.size() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF;
@@ -449,23 +397,53 @@ ReleaseLookup releaseGroup(const nlohmann::json& document, int minimumScore) {
 
 }  // namespace
 
+std::string onlineArtworkCacheKey(const Track& track) {
+    return makeStableId(pathToUtf8(track.path) + "\n" + std::to_string(track.fileSize) +
+                        "\n" + std::to_string(track.modifiedTicks));
+}
+
 void OnlineArtworkFetcher::run(std::span<const Track> tracks,
                                const std::filesystem::path& cacheRoot,
                                const ProgressCallback& onProgress,
                                const MatchCallback& onMatch,
                                const std::atomic_bool* cancel) const {
+    if (cancelled(cancel)) return;
+    BackgroundIoCancellation cancelIo([cancel] { return cancelled(cancel); });
     std::error_code filesystemError;
     std::filesystem::create_directories(cacheRoot, filesystemError);
     if (filesystemError || cancelled(cancel)) return;
+    const auto resultsPath = cacheRoot / L"metadata.json";
+    auto cachedResults = loadAttempts(resultsPath);
+    std::unordered_map<std::string, std::string> trackCacheKeys;
 
     std::vector<AlbumGroup> groups;
     std::unordered_map<std::string, std::size_t> groupIndices;
     for (const auto& track : tracks) {
+        if (cancelled(cancel)) return;
         if (track.mediaKind != MediaKind::Music) continue;
+        const auto key = onlineArtworkCacheKey(track);
+        trackCacheKeys.emplace(track.id, key);
+        const auto previous = cachedResults.find(key);
+        if (previous != cachedResults.end() && previous->is_object()) {
+            const auto filename = jsonString(*previous, "image");
+            const auto image = filename.empty() ? std::filesystem::path{} : cacheRoot / pathFromUtf8(filename);
+            if (filename.empty() || std::filesystem::is_regular_file(image, filesystemError)) {
+                const auto artist = jsonString(*previous, "artist");
+                const auto album = jsonString(*previous, "album");
+                const auto genre = jsonString(*previous, "genre");
+                const auto year = previous->value("albumYear", 0);
+                if (onMatch && (!image.empty() || !artist.empty() || !album.empty() || !genre.empty() || year > 0))
+                    onMatch({{track.id}, image, artist, album, genre, year});
+                continue;
+            }
+            filesystemError.clear();
+        }
         const bool cachedOnline = track.onlineArtwork && std::filesystem::is_regular_file(*track.onlineArtwork, filesystemError);
+        if (cancelled(cancel)) return;
         filesystemError.clear();
         const bool availableSidecar = track.sidecarArtwork &&
                                       std::filesystem::is_regular_file(*track.sidecarArtwork, filesystemError);
+        if (cancelled(cancel)) return;
         filesystemError.clear();
         const bool needsArtwork = !track.hasEmbeddedArtwork && !availableSidecar && !cachedOnline;
         const bool needsArtist = missingMetadataText(track.artist, "Unknown Artist");
@@ -506,7 +484,7 @@ void OnlineArtworkFetcher::run(std::span<const Track> tracks,
 
     InternetHandle session(WinHttpOpen(L"NeonJukebox/1.1 (local Windows artwork fetcher)",
                                         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+                                        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC));
     if (!session) {
         state.processed = groups.size();
         state.retryPending = groups.size();
@@ -859,7 +837,15 @@ void OnlineArtworkFetcher::run(std::span<const Track> tracks,
         filesystemError.clear();
 
         MetadataCandidate metadata;
+        const auto remember = [&] {
+            const nlohmann::json record{{"image", foundArtwork ? pathToUtf8(imagePath.filename()) : ""},
+                {"artist", metadata.artist}, {"album", metadata.album}, {"genre", metadata.genre},
+                {"albumYear", metadata.albumYear}, {"checkedAt", nowUnixMs()}};
+            for (const auto& id : group.trackIds) cachedResults[trackCacheKeys.at(id)] = record;
+            saveAttempts(resultsPath, cachedResults);
+        };
         if (foundArtwork && metadataComplete(group, metadata)) {
+            remember();
             ++state.found;
             if (onMatch) onMatch({group.trackIds, imagePath});
             ++state.processed;
@@ -870,6 +856,7 @@ void OnlineArtworkFetcher::run(std::span<const Track> tracks,
         const std::string attemptKey = std::string(attemptsNamespace) + group.cacheKey;
         const auto lastAttempt = attempts.value(attemptKey, std::int64_t{});
         if (lastAttempt > 0 && nowUnixMs() - lastAttempt < negativeCacheMs) {
+            remember();
             if (foundArtwork) ++state.found;
             ++state.unavailable;
             ++state.processed;
@@ -915,6 +902,9 @@ void OnlineArtworkFetcher::run(std::span<const Track> tracks,
             ++state.unavailable;
         }
         saveAttempts(attemptsPath, attempts);
+        // Completed lookups (including misses) are reused for this exact file
+        // version. Enrichment changing the artist/album cannot trigger new lookups.
+        remember();
         ++state.processed;
         if (onProgress) onProgress(state);
     }

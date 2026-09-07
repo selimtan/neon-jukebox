@@ -51,6 +51,7 @@ std::string visualizerToString(VisualizerMode mode) {
         case VisualizerMode::NeonMosaic: return "neon-mosaic";
         case VisualizerMode::TripleSoundMeter: return "triple-sound-meter";
         case VisualizerMode::WarmTwinVu: return "warm-twin-vu";
+        case VisualizerMode::RetroPhosphorScope: return "retro-phosphor-scope";
         default: return "aurora-spectrum";
     }
 }
@@ -83,6 +84,7 @@ VisualizerMode visualizerFromString(std::string_view value) {
     if (value == "neon-mosaic") return VisualizerMode::NeonMosaic;
     if (value == "triple-sound-meter") return VisualizerMode::TripleSoundMeter;
     if (value == "warm-twin-vu") return VisualizerMode::WarmTwinVu;
+    if (value == "retro-phosphor-scope") return VisualizerMode::RetroPhosphorScope;
     return VisualizerMode::AuroraSpectrum;
 }
 
@@ -146,7 +148,7 @@ void to_json(nlohmann::json& json, const Track& track) {
 void from_json(const nlohmann::json& json, Track& track) {
     track.id = json.value("id", "");
     track.path = pathFromUtf8(json.value("path", ""));
-    track.title = json.value("title", track.path.stem().string());
+    track.title = json.value("title", pathToUtf8(track.path.stem()));
     track.artist = json.value("artist", "Unknown Artist");
     track.album = json.value("album", "Unknown Album");
     track.genre = json.value("genre", "Unknown Genre");
@@ -185,13 +187,17 @@ void from_json(const nlohmann::json& json, PinRecord& pin) {
 void to_json(nlohmann::json& json, const Settings& settings) {
     json = {
         {"schemaVersion", 5}, {"musicRoots", pathsToJson(settings.musicRoots)},
+        {"theme", themeDefinition(settings.theme).id},
         {"videoRoots", pathsToJson(settings.videoRoots)},
         {"adminPin", settings.adminPin}, {"volume", settings.volume},
         {"ambientMode", ambientToString(settings.ambientMode)}, {"ambientRepeat", settings.ambientRepeat},
+        {"ambientMediaKind", settings.ambientMediaKind
+            ? (*settings.ambientMediaKind == MediaKind::Video ? "video" : "music") : "all"},
         {"playbackPositionMs", settings.playbackPositionMs}, {"currentTrackId", settings.currentTrackId},
         {"playbackWasActive", settings.playbackWasActive},
         {"currentTrackManual", settings.currentTrackManual},
         {"visualizerMode", visualizerToString(settings.visualizerMode)},
+        {"retroVisualizerMode", visualizerToString(settings.retroVisualizerMode)},
         {"nowPlayingArtworkMode",
          nowPlayingArtworkModeToString(settings.nowPlayingArtworkMode)}
     };
@@ -199,6 +205,9 @@ void to_json(nlohmann::json& json, const Settings& settings) {
 
 void from_json(const nlohmann::json& json, Settings& settings) {
     settings.schemaVersion = 5;
+    const auto theme = json.find("theme");
+    settings.theme = theme != json.end() && theme->is_string()
+        ? themeFromId(theme->get_ref<const std::string&>()) : Theme::Neon;
     if (json.contains("musicRoots")) {
         settings.musicRoots = pathsFromJson(json, "musicRoots", "libraryRoot");
     } else {
@@ -209,11 +218,25 @@ void from_json(const nlohmann::json& json, Settings& settings) {
     settings.volume = json.value("volume", 0.8F);
     settings.ambientMode = ambientFromString(json.value("ambientMode", "shuffle"));
     settings.ambientRepeat = json.value("ambientRepeat", true);
+    settings.ambientMediaKind.reset();
+    const auto ambientMedia = json.find("ambientMediaKind");
+    if (ambientMedia != json.end() && ambientMedia->is_string()) {
+        if (*ambientMedia == "music") settings.ambientMediaKind = MediaKind::Music;
+        else if (*ambientMedia == "video") settings.ambientMediaKind = MediaKind::Video;
+    }
     settings.playbackPositionMs = json.value("playbackPositionMs", std::int64_t{});
     settings.currentTrackId = json.value("currentTrackId", "");
     settings.playbackWasActive = json.value("playbackWasActive", false);
     settings.currentTrackManual = json.value("currentTrackManual", false);
-    settings.visualizerMode = visualizerFromString(json.value("visualizerMode", "aurora-spectrum"));
+    const auto readVisualizer = [&](const char* key, Theme theme) {
+        const auto found = json.find(key);
+        return themeVisualizer(theme, found != json.end() && found->is_string()
+            ? visualizerFromString(found->get_ref<const std::string&>())
+            : visualizersForTheme(theme).front());
+    };
+    // The legacy selection belongs to Neon; each theme keeps its own selection.
+    settings.visualizerMode = readVisualizer("visualizerMode", Theme::Neon);
+    settings.retroVisualizerMode = readVisualizer("retroVisualizerMode", Theme::Retro);
     settings.nowPlayingArtworkMode = nowPlayingArtworkModeFromString(
         json.value("nowPlayingArtworkMode", "artwork"));
 }

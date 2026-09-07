@@ -10,13 +10,13 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $buildRoot = Join-Path $projectRoot 'build'
 
 # A running Windows executable is locked and cannot be replaced by the linker.
-# Always close every launched jukebox copy before configuring or compiling so
-# the canonical output remains build\Release\neon_jukebox.exe.
-$runningJukebox = Get-Process -Name 'neon_jukebox' -ErrorAction SilentlyContinue
-if ($runningJukebox) {
-    Write-Host 'Closing the running Neon Jukebox before build...' -ForegroundColor Yellow
-    $runningJukebox | Stop-Process -Force
-    $runningJukebox | Wait-Process -ErrorAction SilentlyContinue
+# Always close launched app copies before configuring or compiling so the
+# canonical outputs can be replaced by the linker.
+$runningApps = Get-Process -Name 'neon_jukebox', 'neon_recorder' -ErrorAction SilentlyContinue
+if ($runningApps) {
+    Write-Host 'Closing running Neon applications before build...' -ForegroundColor Yellow
+    $runningApps | Stop-Process -Force
+    $runningApps | Wait-Process -ErrorAction SilentlyContinue
 }
 
 $cmake = Get-Command cmake -ErrorAction SilentlyContinue

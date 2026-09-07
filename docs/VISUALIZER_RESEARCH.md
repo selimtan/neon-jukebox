@@ -71,6 +71,19 @@ general signal-processing and visualization techniques were reimplemented.
 
 ## Signal pipeline
 
+Meters are drawn directly into their final panel, without a scaled visualization
+texture. Column, LED row, arc tick, mesh and particle counts use the available
+physical pixel area, including the window's display scale. Each style retains its
+large-view maximum detail but uses fewer elements in smaller panels. Labels too
+small to read are omitted. Reduced spectrum columns aggregate their input bands
+so narrow peaks across the full frequency range remain visible; history cells
+also combine samples when the panel has fewer rows.
+
+Rendering tests cover all 28 styles at compact and small sizes, independent width
+and height changes, native versus scaled window coordinates, minimum LED sizes,
+panel clipping and narrow peaks in reduced spectra. `neon_visualizer_tests`
+accepts `compact` or `tiny` after its snapshot filename for these contact sheets.
+
 - The audio callback only copies PCM into a fixed-size lock-free publication
   buffer; rendering, FFT-like Goertzel analysis and allocations remain outside
   the real-time callback.

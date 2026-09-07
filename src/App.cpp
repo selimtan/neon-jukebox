@@ -11,6 +11,8 @@
 #include <unordered_set>
 
 #include "neon/Utils.hpp"
+#include "neon/SingleInstance.hpp"
+#include "neon/BackgroundIo.hpp"
 
 namespace neon {
 namespace {
@@ -23,9 +25,10 @@ std::vector<std::filesystem::path> uniqueRoots(
     result.reserve(roots.size());
     for (const auto& requestedRoot : roots) {
         if (requestedRoot.empty()) continue;
-        std::error_code error;
-        const auto canonical = std::filesystem::weakly_canonical(requestedRoot, error);
-        auto root = error ? requestedRoot.lexically_normal() : canonical;
+        // Folder selection and source merging run on the event thread. Resolve
+        // filesystem links/accessibility only inside the background scanner.
+        auto root = requestedRoot.lexically_normal();
+        if (!root.has_filename() && root != root.root_path()) root = root.parent_path();
         if (seen.insert(normalizeForSearch(pathToUtf8(root))).second) {
             result.push_back(std::move(root));
         }
@@ -38,6 +41,7 @@ bool isUnknown(std::string_view value, std::string_view fallback) {
 }
 
 void preserveEnrichedMetadata(Track& target, const Track& current) {
+    target.favorite = current.favorite;
     if (isUnknown(target.artist, "Unknown Artist") &&
         !isUnknown(current.artist, "Unknown Artist")) target.artist = current.artist;
     if (isUnknown(target.album, "Unknown Album") &&
@@ -60,7 +64,8 @@ int App::run() {
     running_ = true;
     while (running_) {
         SDL_Event event;
-        while (SDL_PollEvent(&event)) handleEvent(event);
+        while (running_ && SDL_PollEvent(&event)) handleEvent(event);
+        if (!running_) break; // Exit must not start another load/scan/render frame.
         update();
         render();
         SDL_Delay(8);
@@ -70,7 +75,7 @@ int App::run() {
 }
 
 bool App::initialize(std::string& error) {
-    SDL_SetAppMetadata("Neon Jukebox", "1.0.0", "com.neonjukebox.app");
+    SDL_SetAppMetadata("Neon Jukebox", "1.0.1", "com.neonjukebox.app");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS)) { error = SDL_GetError(); return false; }
     sdlInitialized_ = true;
@@ -79,6 +84,8 @@ bool App::initialize(std::string& error) {
     window_ = SDL_CreateWindow("Neon Jukebox", 1920, 1080,
                                SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window_) { error = SDL_GetError(); return false; }
+    SingleInstance::markWindow(static_cast<HWND>(SDL_GetPointerProperty(
+        SDL_GetWindowProperties(window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr)));
     renderer_ = SDL_CreateRenderer(window_, nullptr);
     if (!renderer_) { error = SDL_GetError(); return false; }
     SDL_SetRenderVSync(renderer_, 1);
@@ -89,9 +96,22 @@ bool App::initialize(std::string& error) {
 
     char* preference = SDL_GetPrefPath("NeonJukebox", "NeonJukebox");
     if (!preference) { error = SDL_GetError(); return false; }
-    storage_ = std::make_unique<Storage>(pathFromUtf8(preference));
+    storage_ = std::make_unique<Storage>(pathFromUtf8(preference),
+                                        pathFromUtf8(SDL_GetBasePath()) / L"library");
     SDL_free(preference);
+    ui_.useLibraryArtworkCache(storage_->libraryRoot());
     settings_ = storage_->loadSettings();
+    library_ = storage_->loadLibrary();
+    // Older settings did not remember the section. Continue in the restored
+    // track's section on upgrade, until the visitor explicitly chooses another.
+    if (!settings_.ambientMediaKind) {
+        if (const auto* previous = LibraryScanner::find(library_, settings_.currentTrackId))
+            settings_.ambientMediaKind = previous->mediaKind;
+    }
+    if (settings_.ambientMediaKind) {
+        libraryFilter_ = *settings_.ambientMediaKind == MediaKind::Video
+            ? LibraryFilter::Video : LibraryFilter::Music;
+    }
     settings_.musicRoots = uniqueRoots(settings_.musicRoots);
     settings_.videoRoots = uniqueRoots(settings_.videoRoots);
     if (settings_.ambientMode != AmbientMode::Shuffle || !settings_.ambientRepeat) {
@@ -100,7 +120,6 @@ bool App::initialize(std::string& error) {
     }
     // Also commits older single/combined-root settings in the split library form.
     storage_->saveSettings(settings_);
-    library_ = storage_->loadLibrary();
     rebuildGenres();
     queue_.restore(storage_->loadQueue());
     audio_.setVolume(settings_.volume);
@@ -126,6 +145,15 @@ bool App::initialize(std::string& error) {
                 if (playTrack(*track, settings_.playbackPositionMs, playError)) {
                     currentTrackId_ = track->id;
                     currentIsManual_ = settings_.currentTrackManual;
+                    if (!currentIsManual_ || credits_.available() == 0) {
+                        const auto restored = std::find_if(
+                            library_.tracks.begin(), library_.tracks.end(),
+                            [&](const Track& candidate) { return candidate.id == track->id; });
+                        if (restored != library_.tracks.end()) {
+                            focusLibraryTrack(static_cast<std::size_t>(
+                                std::distance(library_.tracks.begin(), restored)));
+                        }
+                    }
                 }
             }
         }
@@ -134,6 +162,7 @@ bool App::initialize(std::string& error) {
         // enrichment immediately; local file metadata continues scanning in
         // parallel and takes precedence when present.
         startArtworkFetch();
+        prepareLibraryArtwork(library_.tracks);
         if (currentTrackId_.empty()) startNextTrack();
     }
     lastPersist_ = SDL_GetTicks();
@@ -144,22 +173,46 @@ bool App::initialize(std::string& error) {
 void App::shutdown() {
     if (!initialized_ && !sdlInitialized_ && !ttfInitialized_ && !window_ && !renderer_) return;
     scanCancel_.store(true, std::memory_order_release);
-    if (scanFuture_.valid()) scanFuture_.wait();
-    processScanTrackUpdates();
+    pendingScan_.reset();
     artworkCancel_.store(true, std::memory_order_release);
-    if (artworkFuture_.valid()) artworkFuture_.wait();
     artworkRestartPending_ = false;
+    artworkPreparationStopped_ = true;
+    artworkPreparer_.stop();
+    ui_.cancelBackgroundWork();
+    // Capture resume state before requesting media shutdown. All workers begin
+    // cancelling together, including when a slow drive or provider is pending.
+    persistPlayback();
+    video_.requestShutdown();
+    if (window_) SDL_HideWindow(window_);
+    audio_.shutdown(); // Device mixer destruction belongs on the SDL main thread.
+    waitWithWindowMessages([this] {
+        const auto ready = [](const auto& future) {
+            return !future.valid() || future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        };
+        return ready(scanFuture_) && ready(artworkFuture_);
+    });
+    processScanTrackUpdates();
     processArtworkFetch();
+    std::future<bool> saved;
     if (storage_) {
-        persistPlayback();
-        storage_->saveQueue(queue_.snapshot());
-        storage_->saveLibrary(library_);
+        // Serialize/flush on a worker while the window thread services native
+        // messages. Retain the full catalogue, including unvisited cached files.
+        saved = std::async(std::launch::async, [this, queue = queue_.snapshot()] {
+            const bool queueSaved = storage_->saveQueue(queue);
+            const bool librarySaved = storage_->saveLibrary(library_);
+            return queueSaved && librarySaved && storage_->flush();
+        });
     }
     // Renderer-owned textures and audio callbacks must be released while the
     // SDL subsystems they depend on are still alive.
     video_.shutdown();
-    audio_.shutdown();
     ui_.shutdown();
+    if (saved.valid()) {
+        waitWithWindowMessages([&saved] {
+            return saved.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        });
+        if (!saved.get()) SDL_Log("Unable to save all Jukebox state during shutdown");
+    }
     if (renderer_) { SDL_DestroyRenderer(renderer_); renderer_ = nullptr; }
     if (window_) { SDL_DestroyWindow(window_); window_ = nullptr; }
     if (ttfInitialized_) { TTF_Quit(); ttfInitialized_ = false; }
@@ -180,19 +233,22 @@ void App::handleEvent(SDL_Event& event) {
         setToast("Administrator access is required to exit");
         return;
     }
-    if (event.type == SDL_EVENT_WINDOW_MOUSE_LEAVE) {
+    if (event.type == SDL_EVENT_WINDOW_MOUSE_LEAVE || event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+        ui_.clearPointer();
         adminReveal_ = false;
         visualizerPointerDown_ = false;
         return;
     }
     SDL_ConvertEventToRenderCoordinates(renderer_, &event);
     if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        ui_.updatePointer(event.motion.x, event.motion.y, (event.motion.state & SDL_BUTTON_LMASK) != 0);
         const bool revealArea = event.motion.x <= 230.0F && event.motion.y <= 100.0F;
         const bool hotCorner = event.motion.x <= 12.0F && event.motion.y <= 12.0F;
         adminReveal_ = mode_ == UiMode::Browse && !visualizerOpen_ && !videoFullscreen_ && revealArea &&
                        (adminReveal_ || hotCorner);
     }
     if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+        ui_.updatePointer(event.button.x, event.button.y, true);
         if (visualizerOpen_) {
             visualizerPointerDown_ = true;
             visualizerPointerStartX_ = event.button.x;
@@ -201,6 +257,7 @@ void App::handleEvent(SDL_Event& event) {
         }
     }
     if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
+        ui_.updatePointer(event.button.x, event.button.y, false);
         if (visualizerOpen_ && visualizerPointerDown_) {
             visualizerPointerDown_ = false;
             const float travel = event.button.x - visualizerPointerStartX_;
@@ -210,7 +267,7 @@ void App::handleEvent(SDL_Event& event) {
                 return;
             }
         }
-        if (const auto action = ui_.hitTest(event.button.x, event.button.y)) dispatch(*action);
+        if (const auto action = ui_.hitTest(event.button.x, event.button.y, event.button.timestamp)) dispatch(*action);
     }
     if (event.type == SDL_EVENT_KEY_DOWN && keyboardOpen_ &&
         (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)) {
@@ -237,6 +294,8 @@ void App::handleEvent(SDL_Event& event) {
 }
 
 void App::dispatch(const UiAction& action) {
+    audio_.setEffectsEnabled(settings_.theme == Theme::Retro);
+    ui_.notifyAction(action);
     switch (action.kind) {
         case UiActionKind::OpenAdmin:
             adminReveal_ = false;
@@ -256,15 +315,16 @@ void App::dispatch(const UiAction& action) {
             }
             break;
         case UiActionKind::VisualizerPrevious: {
-            const auto current = static_cast<std::size_t>(settings_.visualizerMode);
-            settings_.visualizerMode = static_cast<VisualizerMode>(
-                (current + visualizerModeCount - 1) % visualizerModeCount);
+            auto& selection = settings_.theme == Theme::Retro
+                ? settings_.retroVisualizerMode : settings_.visualizerMode;
+            selection = adjacentVisualizer(settings_.theme, selection, false);
             storage_->saveSettings(settings_);
             break;
         }
         case UiActionKind::VisualizerNext: {
-            const auto current = static_cast<std::size_t>(settings_.visualizerMode);
-            settings_.visualizerMode = static_cast<VisualizerMode>((current + 1) % visualizerModeCount);
+            auto& selection = settings_.theme == Theme::Retro
+                ? settings_.retroVisualizerMode : settings_.visualizerMode;
+            selection = adjacentVisualizer(settings_.theme, selection, true);
             storage_->saveSettings(settings_);
             break;
         }
@@ -276,15 +336,17 @@ void App::dispatch(const UiAction& action) {
             if (currentIsVideo()) {
                 visualizerOpen_ = false;
                 videoFullscreen_ = !videoFullscreen_;
+                videoInfoStartedAt_.reset();
             }
             break;
-        case UiActionKind::InsertCoin:
+        case UiActionKind::InsertCoin: {
+            const auto before = credits_.available();
             credits_.insert();
-            setToast(std::to_string(credits_.available()) +
-                     (credits_.available() == 1 ? " credit available" : " credits available"));
+            if (credits_.available() > before) audio_.playEffect(UiSoundEffect::Coin);
             break;
+        }
         case UiActionKind::SelectTrack:
-            if (credits_.available() > 0 && action.index < library_.tracks.size()) selectedIndex_ = action.index;
+            if (!pendingPage_ && credits_.available() > 0 && action.index < library_.tracks.size()) selectedIndex_ = action.index;
             break;
         case UiActionKind::AddSelected:
             if (credits_.available() == 0) {
@@ -326,7 +388,6 @@ void App::dispatch(const UiAction& action) {
             } else {
                 break;
             }
-            libraryFilter_ = LibraryFilter::All;
             genreMenuOpen_ = false;
             updateFilter();
             setToast(selectedGenre_.empty() ? "Showing all genres"
@@ -339,18 +400,24 @@ void App::dispatch(const UiAction& action) {
             if ((genreMenuPage_ + 1) * 9 < genres_.size() + 1) ++genreMenuPage_;
             break;
         case UiActionKind::ShowMusic:
-            if (credits_.available() > 0) {
-                genreMenuOpen_ = false; libraryFilter_ = LibraryFilter::Music; updateFilter();
-            }
+            if (credits_.available() > 0) selectLibraryMedia(MediaKind::Music);
             break;
         case UiActionKind::ShowVideo:
-            if (credits_.available() > 0) {
-                genreMenuOpen_ = false; libraryFilter_ = LibraryFilter::Video; updateFilter();
-            }
+            if (credits_.available() > 0) selectLibraryMedia(MediaKind::Video);
             break;
         case UiActionKind::OpenKeyboard:
             if (credits_.available() > 0) {
                 genreMenuOpen_ = false; searchDraft_ = search_; keyboardOpen_ = true;
+            }
+            break;
+        case UiActionKind::SelectArtistInitial:
+            if (mode_ == UiMode::Browse &&
+                credits_.available() > 0 && !keyboardOpen_ && !genreMenuOpen_ &&
+                !playNowPrompt_ && !visualizerOpen_ &&
+                (action.character == '\0' || action.character == '#' ||
+                 (action.character >= 'A' && action.character <= 'Z'))) {
+                selectedArtistInitial_ = action.character;
+                updateFilter();
             }
             break;
         case UiActionKind::KeyCharacter:
@@ -393,7 +460,7 @@ void App::dispatch(const UiAction& action) {
             break;
         case UiActionKind::PinSubmit:
             if (mode_ == UiMode::SetupPin || mode_ == UiMode::ChangePin) {
-                if (!PinGuard::validFormat(pinInput_)) { setToast("PIN must contain 4-8 digits"); break; }
+                if (!PinGuard::validFormat(pinInput_)) { pinPrompt_ = "PIN must contain 4-8 digits"; break; }
                 if (firstPin_.empty()) {
                     firstPin_ = pinInput_; pinInput_.clear(); pinPrompt_ = "Enter the same PIN again";
                 } else if (firstPin_ == pinInput_) {
@@ -408,9 +475,9 @@ void App::dispatch(const UiAction& action) {
                     firstPin_.clear(); pinInput_.clear(); pinPrompt_ = "PINs did not match. Try again";
                 }
             } else if (mode_ == UiMode::AdminPin) {
-                if (pinGuard_.locked()) setToast("Try again in " + std::to_string(pinGuard_.secondsRemaining()) + " seconds");
+                if (pinGuard_.locked()) pinPrompt_ = "Try again in " + std::to_string(pinGuard_.secondsRemaining()) + " seconds";
                 else if (pinGuard_.attempt(pinInput_, settings_.adminPin)) { pinInput_.clear(); mode_ = UiMode::Admin; }
-                else { pinInput_.clear(); setToast("Incorrect PIN"); }
+                else { pinInput_.clear(); pinPrompt_ = "Incorrect PIN"; }
             }
             break;
         case UiActionKind::ChooseMusicFolders: showFolderDialog(MediaKind::Music, true); break;
@@ -429,9 +496,11 @@ void App::dispatch(const UiAction& action) {
             }
             break;
         case UiActionKind::PagePrevious:
-            if (credits_.available() > 0 && page_ > 0) --page_; break;
+            if (page_ > 0) requestPage(page_ - 1);
+            break;
         case UiActionKind::PageNext:
-            if (credits_.available() > 0 && (page_ + 1) * 9 < filtered_.size()) ++page_; break;
+            requestPage(page_ + 1);
+            break;
         case UiActionKind::AdminClose: videoFullscreen_ = false; mode_ = UiMode::Browse; break;
         case UiActionKind::AdminPlayPause:
             if (currentIsVideo()) {
@@ -491,8 +560,33 @@ void App::dispatch(const UiAction& action) {
         case UiActionKind::AdminUseSpinningDisc:
             settings_.nowPlayingArtworkMode = NowPlayingArtworkMode::SpinningDisc;
             storage_->saveSettings(settings_);
-            setToast("Now Playing display: spinning CD");
+            setToast(settings_.theme == Theme::Retro ? "Now Playing display: spinning vinyl"
+                                                    : "Now Playing display: spinning CD");
             break;
+        case UiActionKind::AdminSelectTheme: {
+            if (mode_ != UiMode::Admin || action.index >= themeDefinitions.size()) break;
+            const auto previousTheme = settings_.theme;
+            const auto nextTheme = themeDefinitions[action.index].theme;
+            if (previousTheme == nextTheme) break;
+            std::optional<std::size_t> offset;
+            if (selectedIndex_) {
+                const auto selected = std::find(filtered_.begin(), filtered_.end(), *selectedIndex_);
+                if (selected != filtered_.end())
+                    offset = static_cast<std::size_t>(std::distance(filtered_.begin(), selected));
+            }
+            settings_.theme = nextTheme;
+            if (!storage_->saveSettings(settings_)) {
+                settings_.theme = previousTheme;
+                setToast("Theme could not be saved. Please try again.");
+                break;
+            }
+            page_ = pageAfterThemeChange(previousTheme, nextTheme, page_, filtered_.size(), offset,
+                                         libraryFilter_ == LibraryFilter::Video);
+            pendingPage_.reset();
+            genreMenuOpen_ = false;
+            setToast(std::string(themeDefinition(nextTheme).label));
+            break;
+        }
         case UiActionKind::AdminChangePin:
             firstPin_.clear(); pinInput_.clear(); pinPrompt_ = "Enter a new 4-8 digit PIN";
             mode_ = UiMode::ChangePin; break;
@@ -526,25 +620,31 @@ void App::update() {
     processFolderResult();
     processScan();
     processArtworkFetch();
+    finishPendingPage();
+    for (const auto& track : artworkPreparer_.takeCompleted()) ui_.refreshArtwork(track);
+    prepareNextAmbientVideo();
     if (video_.takeSurfaceTouch() && mode_ == UiMode::Browse && currentIsVideo() &&
         !keyboardOpen_ && !playNowPrompt_ && !visualizerOpen_) {
         dispatch({UiActionKind::ToggleVideoFullscreen});
     }
     if (audioRecoveryPending_ && SDL_GetTicks() >= audioRecoveryAt_) recoverAudio();
+    if (const auto error = video_.takeError(); !error.empty() && storage_) {
+        std::ofstream log(storage_->root() / L"jukebox.log", std::ios::binary | std::ios::app);
+        log << nowUnixMs() << "  video  " << currentTrackId_ << "  " << error << '\n';
+    }
     if (audio_.takeFinished() || video_.takeFinished()) {
         playNowPrompt_ = false;
         requestedTrackTitle_.clear();
         stopPlayback();
         currentTrackId_.clear();
         currentIsManual_ = false;
-        videoFullscreen_ = false;
         startNextTrack();
     }
     if (toastUntil_ && SDL_GetTicks() >= toastUntil_) { toast_.clear(); toastUntil_ = 0; }
     if (SDL_GetTicks() - lastPersist_ >= 5000) {
         persistPlayback();
         if (scanCacheDirty_ && storage_) {
-            storage_->saveLibrary(library_);
+            storage_->saveLibraryAsync(library_);
             scanCacheDirty_ = false;
         }
         lastPersist_ = SDL_GetTicks();
@@ -552,6 +652,7 @@ void App::update() {
 }
 
 void App::render() {
+    audio_.setEffectsEnabled(settings_.theme == Theme::Retro);
     queueView_ = queue_.snapshot();
     ScanProgress progress;
     { std::scoped_lock lock(scanProgressMutex_); progress = scanProgress_; }
@@ -559,6 +660,7 @@ void App::render() {
     { std::scoped_lock lock(artworkMutex_); artworkProgress = artworkProgress_; }
     UiModel model;
     model.mode = mode_;
+    model.theme = settings_.theme;
     model.library = &library_;
     model.filtered = &filtered_;
     model.queue = &queueView_;
@@ -574,6 +676,7 @@ void App::render() {
     model.searchDraft = searchDraft_;
     model.genres = &genres_;
     model.selectedGenre = selectedGenre_;
+    model.selectedArtistInitial = selectedArtistInitial_;
     model.genreMenuOpen = genreMenuOpen_;
     model.genreMenuPage = genreMenuPage_;
     model.pinPrompt = pinPrompt_;
@@ -582,10 +685,12 @@ void App::render() {
     model.keyboardOpen = keyboardOpen_;
     model.adminReveal = adminReveal_;
     model.visualizerOpen = visualizerOpen_;
-    model.visualizerMode = settings_.visualizerMode;
+    model.visualizerMode = themeVisualizer(settings_.theme, settings_.theme == Theme::Retro
+        ? settings_.retroVisualizerMode : settings_.visualizerMode);
     model.nowPlayingArtworkMode = settings_.nowPlayingArtworkMode;
     model.videoFullscreen = videoFullscreen_;
     model.videoPlaying = currentIsVideo();
+    if (model.videoPlaying) model.videoLoadingStatus = video_.loadingStatus();
     model.credits = credits_.available();
     model.playNowPrompt = playNowPrompt_;
     model.requestedTrackTitle = requestedTrackTitle_;
@@ -600,36 +705,127 @@ void App::render() {
     model.artworkCurrent = artworkProgress.current;
     model.toast = toast_;
     model.page = page_;
+    model.pendingPage = pendingPage_;
     model.adminQueueSelection = adminQueueSelection_;
     model.ambientMode = settings_.ambientMode;
     model.ambientRepeat = settings_.ambientRepeat;
     model.musicSourceCount = settings_.musicRoots.size();
     model.videoSourceCount = settings_.videoRoots.size();
+    std::vector<const Track*> visibleArtwork{model.currentTrack, model.selectedTrack};
+    const auto artworkPageSize = themePageSize(settings_.theme, libraryFilter_ == LibraryFilter::Video);
+    for (const auto page : {pendingPage_.value_or(page_), page_, page_ + 1}) {
+        const auto first = page * artworkPageSize;
+        for (auto slot = first; slot < std::min(first + artworkPageSize, filtered_.size()); ++slot)
+            if (filtered_[slot] < library_.tracks.size()) visibleArtwork.push_back(&library_.tracks[filtered_[slot]]);
+    }
+    artworkPreparer_.prioritize(visibleArtwork);
     ui_.render(model);
-    if (mode_ == UiMode::Browse && currentIsVideo() && !visualizerOpen_) {
+    if (ui_.takePageTurnSound()) audio_.playEffect(UiSoundEffect::PageTurn);
+    if (const auto effectError = audio_.takeEffectError(); !effectError.empty()) {
+        std::ofstream log(storage_->root() / L"jukebox.log", std::ios::binary | std::ios::app);
+        log << nowUnixMs() << "  sound effects  " << effectError << '\n';
+    }
+    if (mode_ == UiMode::Browse && currentIsVideo() && !visualizerOpen_ &&
+        !keyboardOpen_ && !genreMenuOpen_ && !playNowPrompt_) {
         video_.render(videoFullscreen_ ? SDL_FRect{0, 0, 1920, 1080}
-                                      : SDL_FRect{65, 178, 340, 340});
+                                      : UI::nowPlayingMediaRect(settings_.theme, true));
+        if (fullscreenVideoInfoVisible(SDL_GetTicks())) {
+            const auto& image = ui_.videoInfoImage(*currentTrack());
+            video_.renderOverlay(image.pixels, image.revision);
+        } else video_.hideOverlay();
     } else {
         video_.hide();
     }
 }
 
+void App::requestPage(std::size_t page) {
+    if (pendingPage_ || ui_.pageTurnActive() || credits_.available() == 0 ||
+        mode_ != UiMode::Browse || keyboardOpen_ || genreMenuOpen_ || playNowPrompt_ ||
+        visualizerOpen_ || videoFullscreen_ || filtered_.empty() ||
+        page > (filtered_.size() - 1) / themePageSize(settings_.theme, libraryFilter_ == LibraryFilter::Video)) return;
+    pendingPage_ = page;
+    finishPendingPage();
+}
+
+void App::finishPendingPage() {
+    if (!pendingPage_) return;
+    if (credits_.available() == 0 || mode_ != UiMode::Browse || keyboardOpen_ ||
+        genreMenuOpen_ || playNowPrompt_ || visualizerOpen_ || videoFullscreen_ ||
+        filtered_.empty() || *pendingPage_ > (filtered_.size() - 1) / themePageSize(settings_.theme, libraryFilter_ == LibraryFilter::Video)) {
+        pendingPage_.reset();
+        return;
+    }
+    const bool videoCases = settings_.theme == Theme::Retro && libraryFilter_ == LibraryFilter::Video;
+    if ((videoCases || ui_.pageArtworkReady(library_, filtered_, settings_.theme, *pendingPage_, libraryFilter_)) &&
+        ui_.beginPageTurn(*pendingPage_ > page_)) {
+        page_ = *pendingPage_;
+        pendingPage_.reset();
+    }
+}
+
+void App::selectLibraryMedia(MediaKind kind) {
+    genreMenuOpen_ = false;
+    libraryFilter_ = kind == MediaKind::Video ? LibraryFilter::Video : LibraryFilter::Music;
+    // Playback focus may temporarily reveal an older request from the other
+    // section; only an explicit section choice changes the ambient pool.
+    if (settings_.ambientMediaKind != kind) {
+        settings_.ambientMediaKind = kind;
+        ambientSelector_.reset();
+        storage_->saveSettingsAsync(settings_);
+    }
+    updateFilter();
+    if (initialized_ && currentTrackId_.empty() && !audioRecoveryPending_)
+        startNextTrack();
+}
+
 void App::updateFilter(bool resetPage) {
+    if (resetPage) pendingPage_.reset();
     std::string selectedId = selectedTrack() ? selectedTrack()->id : std::string{};
     const std::size_t previousPage = page_;
-    filtered_ = LibraryScanner::filter(library_, search_, libraryFilter_, selectedGenre_);
+    filtered_ = LibraryScanner::filter(library_, search_, libraryFilter_, selectedGenre_, selectedArtistInitial_);
     if (resetPage || filtered_.empty()) {
         page_ = 0;
     } else {
-        constexpr std::size_t pageSize = 9;
+        const std::size_t pageSize = themePageSize(settings_.theme, libraryFilter_ == LibraryFilter::Video);
         const std::size_t lastPage = (filtered_.size() - 1) / pageSize;
         page_ = std::min(previousPage, lastPage);
     }
     selectedIndex_.reset();
     if (!selectedId.empty()) {
-        for (std::size_t i = 0; i < library_.tracks.size(); ++i) {
+        for (const auto i : filtered_) {
             if (library_.tracks[i].id == selectedId) { selectedIndex_ = i; break; }
         }
+    }
+}
+
+void App::focusLibraryTrack(std::size_t libraryIndex) {
+    if (libraryIndex >= library_.tracks.size()) return;
+    // Preserve active artist browsing while the visitor can still request songs.
+    if (selectedArtistInitial_ && credits_.available() > 0) return;
+
+    pendingPage_.reset();
+    selectedIndex_ = libraryIndex;
+    auto visible = std::find(filtered_.begin(), filtered_.end(), libraryIndex);
+    if (visible == filtered_.end()) {
+        // Reveal the playing track when a previous visitor's filters hide it.
+        search_.clear();
+        searchDraft_.clear();
+        selectedGenre_.clear();
+        selectedArtistInitial_ = '\0';
+        if (libraryFilter_ == LibraryFilter::Music || libraryFilter_ == LibraryFilter::Video) {
+            libraryFilter_ = library_.tracks[libraryIndex].mediaKind == MediaKind::Video
+                ? LibraryFilter::Video : LibraryFilter::Music;
+        } else {
+            libraryFilter_ = LibraryFilter::All;
+        }
+        genreMenuOpen_ = false;
+        updateFilter();
+        visible = std::find(filtered_.begin(), filtered_.end(), libraryIndex);
+    }
+    if (visible != filtered_.end()) {
+        const std::size_t pageSize = themePageSize(settings_.theme, libraryFilter_ == LibraryFilter::Video);
+        page_ = static_cast<std::size_t>(std::distance(filtered_.begin(), visible)) / pageSize;
+        selectedIndex_ = libraryIndex;
     }
 }
 
@@ -646,15 +842,16 @@ void App::rebuildGenres() {
     genreMenuPage_ = 0;
 }
 
-void App::processScanTrackUpdates() {
+bool App::processScanTrackUpdates() {
     std::vector<Track> updates;
     {
         std::scoped_lock lock(scanTrackMutex_);
         updates.swap(scanTrackUpdates_);
     }
-    if (updates.empty()) return;
+    if (updates.empty()) return false;
 
     bool metadataChanged = false;
+    bool tracksAdded = false;
     std::unordered_map<std::string, std::size_t> indexById;
     indexById.reserve(library_.tracks.size());
     for (std::size_t index = 0; index < library_.tracks.size(); ++index) {
@@ -662,17 +859,25 @@ void App::processScanTrackUpdates() {
     }
     for (auto& update : updates) {
         const auto position = indexById.find(update.id);
-        if (position == indexById.end()) continue;
+        if (position == indexById.end()) {
+            indexById.emplace(update.id, library_.tracks.size());
+            library_.tracks.push_back(std::move(update));
+            prepareLibraryArtwork(std::span<const Track>(&library_.tracks.back(), 1));
+            tracksAdded = scanCacheDirty_ = true;
+            continue;
+        }
         auto& found = library_.tracks[position->second];
 
         preserveEnrichedMetadata(update, found);
         metadataChanged = metadataChanged || found.title != update.title ||
             found.artist != update.artist || found.album != update.album ||
-            found.genre != update.genre || found.albumYear != update.albumYear;
+            found.genre != update.genre || found.albumYear != update.albumYear ||
+            found.mediaKind != update.mediaKind;
         found = std::move(update);
+        prepareLibraryArtwork(std::span<const Track>(&found, 1));
         scanCacheDirty_ = true;
     }
-    if (!metadataChanged) return;
+    if (!metadataChanged && !tracksAdded) return false;
 
     const auto oldPage = genreMenuPage_;
     rebuildGenres();
@@ -680,17 +885,25 @@ void App::processScanTrackUpdates() {
     const auto genrePages = std::max<std::size_t>(1, (genres_.size() + 1 + genrePageSize - 1) /
                                                      genrePageSize);
     genreMenuPage_ = std::min(oldPage, genrePages - 1);
-    if (!selectedGenre_.empty() || !search_.empty()) updateFilter(false);
+    updateFilter(false);
+    return tracksAdded;
 }
 
 void App::startScan(std::vector<std::filesystem::path> musicRoots,
                     std::vector<std::filesystem::path> videoRoots) {
     musicRoots = uniqueRoots(musicRoots);
     videoRoots = uniqueRoots(videoRoots);
-    if ((musicRoots.empty() && videoRoots.empty()) || scanning_) return;
+    if (musicRoots.empty() && videoRoots.empty()) return;
     if (artworkFetching_) {
         artworkCancel_.store(true, std::memory_order_release);
         artworkRestartPending_ = true;
+    }
+    if (scanning_) {
+        // Coalesce edits while cancellation is in flight. Do not overwrite an
+        // active std::async future (its assignment would block the UI thread).
+        pendingScan_ = ScanRequest{std::move(musicRoots), std::move(videoRoots)};
+        scanCancel_.store(true, std::memory_order_release);
+        return;
     }
     scanCancel_.store(false, std::memory_order_release);
     scanning_ = true;
@@ -719,12 +932,28 @@ void App::startScan(std::vector<std::filesystem::path> musicRoots,
 }
 
 void App::processScan() {
-    processScanTrackUpdates();
+    const bool tracksAdded = processScanTrackUpdates();
+    if (tracksAdded && scanning_ && currentTrackId_.empty() && !audioRecoveryPending_ &&
+        !library_.tracks.empty()) startNextTrack();
     if (!scanning_ || !scanFuture_.valid() ||
         scanFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    if (pendingScan_) {
+        // The cancelled result may omit most of the catalogue. Keep the live
+        // cache and published metadata, then start exactly one replacement scan.
+        try { (void)scanFuture_.get(); } catch (...) { /* Replaced scan is obsolete. */ }
+        processScanTrackUpdates();
+        scanning_ = false;
+        auto request = std::move(*pendingScan_);
+        pendingScan_.reset();
+        startScan(std::move(request.musicRoots), std::move(request.videoRoots));
+        return;
+    }
     try {
         const std::string selectedId = selectedTrack() ? selectedTrack()->id : std::string{};
         auto scannedLibrary = scanFuture_.get();
+        // The completed snapshot already contains any updates queued since
+        // this frame drained the mailbox.
+        { std::scoped_lock lock(scanTrackMutex_); scanTrackUpdates_.clear(); }
         std::unordered_map<std::string, const Track*> currentById;
         currentById.reserve(library_.tracks.size());
         for (const auto& track : library_.tracks) currentById.emplace(track.id, &track);
@@ -740,10 +969,11 @@ void App::processScan() {
             for (std::size_t i = 0; i < library_.tracks.size(); ++i)
                 if (library_.tracks[i].id == selectedId) { selectedIndex_ = i; break; }
         }
-        storage_->saveLibrary(library_);
+        storage_->saveLibraryAsync(library_);
         scanCacheDirty_ = false;
         updateFilter(false);
         setToast("Library ready: " + std::to_string(library_.tracks.size()) + " tracks");
+        prepareLibraryArtwork(library_.tracks);
         startArtworkFetch();
         if (currentTrackId_.empty()) startNextTrack();
     } catch (const std::exception& exception) {
@@ -769,7 +999,7 @@ void App::startArtworkFetch() {
     }
 
     const auto tracks = library_.tracks;
-    const auto cacheRoot = storage_->root() / L"artwork";
+    const auto cacheRoot = storage_->libraryRoot() / L"artwork";
     artworkFuture_ = std::async(std::launch::async, [this, tracks, cacheRoot] {
         OnlineArtworkFetcher fetcher;
         fetcher.run(tracks, cacheRoot,
@@ -783,6 +1013,12 @@ void App::startArtworkFetch() {
                     },
                     &artworkCancel_);
     });
+}
+
+void App::prepareLibraryArtwork(std::span<const Track> tracks) {
+    if (!storage_ || tracks.empty() || artworkPreparationStopped_) return;
+    artworkPreparer_.start(storage_->libraryRoot());
+    artworkPreparer_.enqueue(tracks);
 }
 
 void App::processArtworkFetch() {
@@ -803,6 +1039,7 @@ void App::processArtworkFetch() {
             if (!match.imagePath.empty() && !found->hasEmbeddedArtwork && !found->sidecarArtwork &&
                 found->onlineArtwork != match.imagePath) {
                 found->onlineArtwork = match.imagePath;
+                prepareLibraryArtwork(std::span<const Track>(&*found, 1));
                 libraryChanged = true;
             }
             if ((found->artist.empty() || found->artist == "Unknown Artist") && !match.artist.empty()) {
@@ -832,7 +1069,9 @@ void App::processArtworkFetch() {
         genreMenuPage_ = std::min(oldPage, genrePages - 1);
         if (!selectedGenre_.empty() || !search_.empty()) updateFilter(false);
     }
-    if (libraryChanged && storage_) storage_->saveLibrary(library_);
+    if (libraryChanged && storage_) {
+        storage_->saveLibraryAsync(library_);
+    }
 
     if (!artworkFetching_) {
         if (artworkRestartPending_ && !scanning_) startArtworkFetch();
@@ -858,6 +1097,8 @@ void App::processArtworkFetch() {
 }
 
 void App::showFolderDialog(MediaKind mediaKind, bool setup) {
+    if (folderDialogOpen_) return;
+    folderDialogOpen_ = true;
     folderForSetup_ = setup;
     folderMediaKind_ = mediaKind;
     const auto& roots = mediaKind == MediaKind::Music ? settings_.musicRoots : settings_.videoRoots;
@@ -876,6 +1117,7 @@ void App::processFolderResult() {
         pendingFolders_.clear();
         folderResultReady_ = false;
     }
+    folderDialogOpen_ = false;
     selectedFolders = uniqueRoots(selectedFolders);
     if (selectedFolders.empty()) return;
 
@@ -889,7 +1131,7 @@ void App::processFolderResult() {
     targetRoots = std::move(merged);
     library_.musicRoots = settings_.musicRoots;
     library_.videoRoots = settings_.videoRoots;
-    storage_->saveSettings(settings_);
+    storage_->saveSettingsAsync(settings_);
     if (added == 0) {
         setToast("Those media sources are already in the library");
         return;
@@ -930,12 +1172,13 @@ void App::recoverAudio() {
 }
 
 bool App::playTrack(const Track& track, std::int64_t startMs, std::string& error) {
-    videoFullscreen_ = false;
+    videoInfoStartedAt_.reset();
     if (track.mediaKind == MediaKind::Video) {
         audio_.stop();
         video_.setVolume(settings_.volume);
         return video_.play(track, startMs, error);
     }
+    videoFullscreen_ = false;
     video_.stop();
     if (!audio_.initialized() && !audio_.initialize(error)) return false;
     audio_.setVolume(settings_.volume);
@@ -945,12 +1188,64 @@ bool App::playTrack(const Track& track, std::int64_t startMs, std::string& error
 void App::stopPlayback() {
     audio_.stop();
     video_.stop();
-    videoFullscreen_ = false;
+    // A clip transition keeps the visitor's video display choice.
+}
+
+bool App::fullscreenVideoInfoVisible(std::uint64_t ticks) {
+    if (!videoFullscreen_ || !currentIsVideo() || video_.loading()) return false;
+    if (!videoInfoStartedAt_) videoInfoStartedAt_ = ticks;
+    return ticks - *videoInfoStartedAt_ < 10'000;
 }
 
 bool App::currentIsVideo() const {
     const auto* track = currentTrack();
     return track && track->mediaKind == MediaKind::Video;
+}
+
+const Track* App::nextAmbientTrack() {
+    // Search, genre and artist filters affect browsing, not the shuffle pool.
+    std::vector<std::size_t> candidates;
+    candidates.reserve(library_.tracks.size());
+    for (std::size_t i = 0; i < library_.tracks.size(); ++i) {
+        if (!settings_.ambientMediaKind || library_.tracks[i].mediaKind == *settings_.ambientMediaKind)
+            candidates.push_back(i);
+    }
+    if (const auto index = ambientSelector_.next(AmbientMode::Shuffle, true, candidates.size(), random_))
+        return &library_.tracks[candidates[*index]];
+    return nullptr;
+}
+
+void App::prepareNextAmbientVideo() {
+    const bool eligible = currentIsVideo() && queue_.empty() &&
+        settings_.ambientMediaKind == MediaKind::Video;
+    if (!eligible) {
+        nextAmbientVideo_.reset();
+        video_.cancelPreload();
+        return;
+    }
+    if (nextAmbientVideo_) {
+        const auto* indexed = LibraryScanner::find(library_, nextAmbientVideo_->id);
+        if (!indexed || indexed->path != nextAmbientVideo_->path ||
+            indexed->fileSize != nextAmbientVideo_->fileSize ||
+            indexed->modifiedTicks != nextAmbientVideo_->modifiedTicks) {
+            nextAmbientVideo_.reset();
+            video_.cancelPreload();
+        } else if (video_.preloadState() == VideoEngine::PreloadState::Failed) {
+            if (storage_) {
+                std::ofstream log(storage_->root() / L"jukebox.log", std::ios::binary | std::ios::app);
+                log << nowUnixMs() << "  video prefetch  " << indexed->id << "  " << video_.preloadError() << '\n';
+            }
+            nextAmbientVideo_.reset();
+            video_.cancelPreload();
+        } else return;
+    }
+    // Start only once the current decoder is ready, leaving its initial source
+    // copy first in line. Failed candidates are replaced while this clip plays.
+    if (video_.loading()) return;
+    if (const auto* next = nextAmbientTrack(); next && next->mediaKind == MediaKind::Video) {
+        nextAmbientVideo_ = *next;
+        video_.preload(*next);
+    }
 }
 
 void App::startNextTrack() {
@@ -960,22 +1255,33 @@ void App::startNextTrack() {
         const Track* next{};
         currentIsManual_ = false;
         if (const auto queued = queue_.popFront()) {
+            nextAmbientVideo_.reset();
             next = LibraryScanner::find(library_, queued->trackId);
             currentIsManual_ = true;
             storage_->saveQueue(queue_.snapshot());
-        } else if (const auto index = ambientSelector_.next(
-                       AmbientMode::Shuffle, true, library_.tracks.size(), random_)) {
-            next = &library_.tracks[*index];
-        } else break;
-        if (!next || !std::filesystem::exists(next->path)) continue;
+        } else {
+            if (nextAmbientVideo_ && settings_.ambientMediaKind == MediaKind::Video &&
+                video_.preloadState() != VideoEngine::PreloadState::Failed) {
+                next = LibraryScanner::find(library_, nextAmbientVideo_->id);
+            }
+            nextAmbientVideo_.reset();
+            if (!next) next = nextAmbientTrack();
+            if (!next) break;
+        }
+        // Video opening and filesystem access belong to the media worker.
+        if (!next || (next->mediaKind != MediaKind::Video && !std::filesystem::exists(next->path))) continue;
         std::string error;
         if (playTrack(*next, 0, error)) {
             currentTrackId_ = next->id;
+            if (!currentIsManual_ || credits_.available() == 0) {
+                focusLibraryTrack(static_cast<std::size_t>(next - library_.tracks.data()));
+            }
             persistPlayback();
             return;
         }
         setToast("Skipped unreadable media: " + next->title, 4500);
     }
+    videoFullscreen_ = false;
     persistPlayback();
 }
 
@@ -997,7 +1303,7 @@ void App::persistPlayback() {
         (video ? video_.playing() && !video_.paused() :
          audioRecoveryPending_ ? !recoveryPaused_ : audio_.playing() && !audio_.paused());
     settings_.currentTrackManual = currentIsManual_;
-    storage_->saveSettings(settings_);
+    storage_->saveSettingsAsync(settings_);
 }
 
 void App::setToast(std::string message, std::uint64_t durationMs) {
