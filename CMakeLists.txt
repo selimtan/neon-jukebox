@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 
-project(NeonJukebox VERSION 1.0.1 LANGUAGES C CXX)
+project(NeonJukebox VERSION 1.0.2 LANGUAGES C CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -188,6 +188,10 @@ if(MSVC)
 endif()
 
 if(NEON_BUILD_TESTING)
+    add_test(NAME neon_kiosk_setup_tests
+        COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kiosk_setup.ps1")
+    set_tests_properties(neon_kiosk_setup_tests PROPERTIES TIMEOUT 30)
     add_executable(neon_single_instance_tests tests/test_single_instance.cpp src/SingleInstance.cpp)
     target_include_directories(neon_single_instance_tests PRIVATE include)
     target_compile_definitions(neon_single_instance_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
@@ -310,7 +314,8 @@ install(TARGETS neon_jukebox neon_recorder RUNTIME DESTINATION . COMPONENT Appli
 install(DIRECTORY assets/ DESTINATION assets COMPONENT Application
         PATTERN "DSEG*" EXCLUDE)
 install(FILES README.md LICENSE THIRD_PARTY_NOTICES.md DESTINATION . COMPONENT Application)
-install(FILES docs/VISUALIZER_RESEARCH.md docs/ARTWORK_SOURCES.md docs/THEMES.md DESTINATION docs COMPONENT Application)
+install(FILES scripts/Install-Jukebox.ps1 DESTINATION . COMPONENT Application)
+install(FILES docs/VISUALIZER_RESEARCH.md docs/ARTWORK_SOURCES.md docs/THEMES.md docs/KIOSK_SETUP.md DESTINATION docs COMPONENT Application)
 install(FILES "${sdl3_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses
         RENAME SDL3-LICENSE.txt COMPONENT Application)
 install(FILES "${sdl3_mixer_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses

@@ -38,6 +38,18 @@ launched from different folders. Opening the EXE again restores the existing
 window and asks Windows to bring it forward. The startup lock is automatically
 released on exit or a crash, so the application can be reopened normally.
 
+## Dedicated Jukebox Windows account
+
+`Install-Jukebox.ps1` creates a passwordless standard local **Jukebox** account
+whose Windows shell launches Neon Jukebox instead of the desktop. Place the
+script beside `neon_jukebox.exe` and `assets`, then run it with PowerShell; it
+requests administrator elevation. Windows 10/11 Pro, Enterprise or Education
+(64-bit) is required. Other users and automatic Windows sign-in are unaffected.
+The script is self-contained and included in application packages. See
+[the Turkish setup guide](docs/KIOSK_SETUP.md) for installation, updates,
+network media access, clearing sources with `-ResetSources`, and restoring the
+desktop with `-RestoreDesktop`.
+
 ## Recorder
 
 Turn automatic mode off, press **KAYDI BAŞLAT**, and play the desired track in

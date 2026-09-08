@@ -75,7 +75,7 @@ int App::run() {
 }
 
 bool App::initialize(std::string& error) {
-    SDL_SetAppMetadata("Neon Jukebox", "1.0.1", "com.neonjukebox.app");
+    SDL_SetAppMetadata("Neon Jukebox", "1.0.2", "com.neonjukebox.app");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS)) { error = SDL_GetError(); return false; }
     sdlInitialized_ = true;
