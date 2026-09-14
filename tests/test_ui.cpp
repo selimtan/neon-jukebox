@@ -448,6 +448,199 @@ void verifyPageTurns(neon::UI& ui, neon::UiModel model, SDL_Surface* surface,
     }
 }
 
+void verifyRadio(SDL_Renderer* renderer, SDL_Surface* surface, const std::filesystem::path& output) {
+    neon::LibraryIndex library;
+    neon::Track music;
+    music.id = "radio-test-music";
+    music.title = "Atlas song";
+    library.tracks.push_back(music);
+    auto video = music;
+    video.id = "radio-test-video";
+    video.mediaKind = neon::MediaKind::Video;
+    library.tracks.push_back(video);
+    for (int i = 22; i >= 0; --i) {
+        neon::Track station;
+        station.id = "radio-test-" + std::to_string(i);
+        station.mediaKind = neon::MediaKind::Radio;
+        station.title = i == 22 ? "Zorlu FM" : i == 21 ? "Bosphorus FM" :
+            "Atlas " + std::string(i < 10 ? "0" : "") + std::to_string(i);
+        station.artist = i == 22 ? "A broadcaster" : station.title;
+        station.album = "Turkey / Istanbul";
+        station.genre = i == 22 ? "Pop" : "Jazz";
+        station.streamUrl = "https://example.invalid/radio/" + std::to_string(i);
+        library.tracks.push_back(std::move(station));
+    }
+    auto filtered = neon::LibraryScanner::filter(library, {}, neon::LibraryFilter::Radio);
+    CHECK(filtered.size() == 23);
+    for (std::size_t i = 0; i < filtered.size(); ++i) {
+        CHECK(library.tracks[filtered[i]].mediaKind == neon::MediaKind::Radio);
+        if (i) CHECK(library.tracks[filtered[i - 1]].title < library.tracks[filtered[i]].title);
+    }
+    CHECK(neon::LibraryScanner::filter(library, {}, neon::LibraryFilter::Music) == std::vector<std::size_t>{0});
+    CHECK(neon::LibraryScanner::filter(library, {}, neon::LibraryFilter::Video) == std::vector<std::size_t>{1});
+    const auto stations = filtered;
+    const auto digest = [&](SDL_FRect rect) {
+        const float scale = std::min(surface->w / 1920.0F, surface->h / 1080.0F);
+        const float ox = (surface->w - 1920 * scale) / 2;
+        const float oy = (surface->h - 1080 * scale) / 2;
+        std::uint64_t hash = 1469598103934665603ULL;
+        SDL_LockSurface(surface);
+        for (int y = static_cast<int>(oy + rect.y * scale); y < static_cast<int>(oy + (rect.y + rect.h) * scale); ++y) {
+            const auto* pixels = static_cast<const unsigned char*>(surface->pixels) + y * surface->pitch;
+            for (int x = static_cast<int>(ox + rect.x * scale) * 4; x < static_cast<int>(ox + (rect.x + rect.w) * scale) * 4; ++x)
+                hash = (hash ^ pixels[x]) * 1099511628211ULL;
+        }
+        SDL_UnlockSurface(surface);
+        return hash;
+    };
+    for (const auto theme : {neon::Theme::Neon, neon::Theme::Retro}) {
+        neon::UI ui;
+        std::string error;
+        CHECK(ui.initialize(renderer, error));
+        neon::UiModel model;
+        CHECK(!model.radioFetching && model.radioStatus.empty() && model.radioLoadingStatus.empty());
+        model.theme = theme;
+        model.library = &library;
+        model.filtered = &filtered;
+        model.libraryFilter = neon::LibraryFilter::Radio;
+        model.credits = 1;
+        filtered = stations;
+        model.currentTrack = &library.tracks[filtered.front()];
+        model.selectedTrack = model.currentTrack;
+        model.playback.state = neon::PlaybackState::Playing;
+        const bool retro = theme == neon::Theme::Retro;
+        const float navY = retro ? 71.0F : 53.0F;
+        const float radioX = retro ? 1298.0F : 1778.0F;
+        const float cardX = retro ? 300.0F : 600.0F;
+        const float cardY = retro ? 226.0F : 260.0F;
+        const float addX = retro ? 1770.0F : 330.0F;
+        const float coinX = retro ? 1540.0F : 140.0F;
+        const float controlY = retro ? 1017.0F : 978.0F;
+        const SDL_FRect cardText = retro ? SDL_FRect{240, 198, 425, 58} : SDL_FRect{506, 362, 244, 82};
+        const SDL_FRect timeDisplay = retro ? SDL_FRect{1456, 174, 404, 34} : SDL_FRect{65, 650, 350, 55};
+        const SDL_FRect statusText = retro ? SDL_FRect{1456, 144, 404, 22} : SDL_FRect{60, 620, 350, 26};
+        const auto render = [&] { ui.render(model, 1000); };
+        const auto save = [&](std::string_view suffix) {
+            if (output.empty()) return;
+            const auto path = output / (std::string(retro ? "retro-radio-" : "neon-radio-") + std::string(suffix) +
+                "-" + std::to_string(surface->w) + ".png");
+            CHECK(IMG_SavePNG(surface, neon::pathToUtf8(path).c_str()));
+        };
+        render();
+        constexpr std::array kinds{neon::UiActionKind::ShowMusic, neon::UiActionKind::ShowVideo, neon::UiActionKind::ShowRadio};
+        for (std::size_t i = 0; i < kinds.size(); ++i) {
+            const float left = (retro ? 904.0F : 1194.0F) + i * (retro ? 160.0F : 236.0F);
+            const float width = retro ? 148.0F : 224.0F;
+            for (const float edge : {1.0F, width / 2, width - 1}) CHECK(actionAt(ui, left + edge, navY, kinds[i]));
+            if (i < 2) CHECK(!ui.hitTest(left + width + 6, navY));
+        }
+        CHECK(actionAt(ui, cardX, cardY, neon::UiActionKind::SelectTrack, filtered.front()));
+        CHECK(actionAt(ui, addX, controlY, neon::UiActionKind::AddSelected));
+        CHECK(actionAt(ui, retro ? 1250.0F : 1260.0F, 992, neon::UiActionKind::PageNext));
+        save("stations");
+        const auto stationText = digest(cardText);
+        const auto liveDisplay = digest(timeDisplay);
+        const auto remaining = digest({1582, 226, 294, 72});
+        auto& first = library.tracks[filtered.front()];
+        first.artist = "Unknown Artist"; // Repeated station names must not add a second title line.
+        first.durationMs = 3678000;
+        model.playback.durationMs = 3678000;
+        model.playback.positionMs = 120000;
+        render();
+        CHECK(digest(cardText) == stationText);
+        CHECK(digest(timeDisplay) == liveDisplay); // Live radio never shows a finite duration/progress.
+        if (retro) CHECK(digest({1582, 226, 294, 72}) == remaining);
+        first.artist = first.title;
+        const auto metadata = digest(cardText);
+        first.album = "Turkey / Ankara";
+        render();
+        CHECK(digest(cardText) != metadata); // Includes location and invalidates Retro's cached paper labels.
+        first.album = "Turkey / Istanbul";
+        model.radioLoadingStatus = "Connecting to station...";
+        render();
+        CHECK(digest(timeDisplay) != liveDisplay);
+        const auto connecting = digest(statusText);
+        model.radioLoadingStatus = "Buffering live audio...";
+        render();
+        CHECK(digest(statusText) != connecting);
+        save("connecting");
+        const auto buffering = digest(statusText);
+        if (retro) {
+            ui.render(model, 21500); // Connection status survives the periodic coin reminder.
+            CHECK(digest(statusText) == buffering);
+        }
+        model.radioLoadingStatus.clear();
+        model.credits = 0;
+        render();
+        CHECK(!ui.hitTest(cardX, cardY) && !ui.hitTest(addX, controlY));
+        CHECK(!ui.hitTest(radioX, navY));
+        CHECK(!ui.hitTest(retro ? 268.0F : 375.0F, navY));
+        CHECK(!ui.hitTest(retro ? 76.0F : 64.0F, retro ? 136.0F : 120.0F));
+        CHECK(actionAt(ui, coinX, controlY, neon::UiActionKind::InsertCoin));
+        model.credits = 1;
+        model.selectedTrack = nullptr;
+        render();
+        CHECK(!ui.hitTest(addX, controlY));
+        model.page = (filtered.size() - 1) / neon::themePageSize(theme);
+        render();
+        CHECK(actionAt(ui, cardX, cardY, neon::UiActionKind::SelectTrack,
+                       filtered[model.page * neon::themePageSize(theme)]));
+        CHECK(!ui.hitTest(retro ? 1250.0F : 1260.0F, 992));
+        model.page = 0;
+        model.selectedArtistInitial = 'B';
+        filtered = neon::LibraryScanner::filter(library, {}, neon::LibraryFilter::Radio, {}, 'B');
+        CHECK(filtered == std::vector<std::size_t>{3});
+        render();
+        CHECK(actionAt(ui, cardX, cardY, neon::UiActionKind::SelectTrack, 3));
+        save("initial-b");
+        model.selectedArtistInitial = 0;
+        model.search = "Zorlu";
+        model.selectedGenre = "Pop";
+        filtered = neon::LibraryScanner::filter(library, model.search, model.libraryFilter, model.selectedGenre);
+        CHECK(filtered == std::vector<std::size_t>{2});
+        render();
+        CHECK(actionAt(ui, cardX, cardY, neon::UiActionKind::SelectTrack, 2));
+        model.search = "No such station";
+        filtered = neon::LibraryScanner::filter(library, model.search, model.libraryFilter);
+        CHECK(filtered.empty());
+        render();
+        CHECK(!ui.hitTest(cardX, cardY) && !ui.hitTest(retro ? 1000.0F : 900.0F, cardY));
+        CHECK(actionAt(ui, radioX, navY, neon::UiActionKind::ShowRadio));
+        const SDL_FRect notice = retro ? SDL_FRect{254, 501, 920, 146} : SDL_FRect{500, 450, 860, 146};
+        const auto noMatch = digest(notice);
+        save("no-match");
+        model.search.clear();
+        model.selectedGenre.clear();
+        model.currentTrack = nullptr;
+        model.library = nullptr; // Radio-only first run while the local scanner is empty.
+        model.scanning = true;
+        CHECK(!model.buildingEmptyLibrary());
+        render();
+        const auto empty = digest(notice);
+        CHECK(empty != noMatch);
+        model.radioFetching = true;
+        render();
+        CHECK(digest(notice) != empty);
+        CHECK(!ui.hitTest(cardX, cardY));
+        save("loading");
+        model.radioFetching = false;
+        model.radioStatus = "Radio directory unavailable. Check your internet connection.";
+        render();
+        CHECK(digest(notice) != empty);
+        CHECK(actionAt(ui, radioX, navY, neon::UiActionKind::ShowRadio));
+        save("error");
+        model.radioStatus.clear();
+        render();
+        CHECK(digest(notice) == empty); // Removing an error removes its stale text.
+        model.mode = neon::UiMode::SetupFolder;
+        render();
+        CHECK(actionAt(ui, 960, 803, neon::UiActionKind::FinishFolderSetup));
+        CHECK(actionAt(ui, 680, 599, neon::UiActionKind::ChooseMusicFolders));
+        CHECK(actionAt(ui, 1240, 599, neon::UiActionKind::ChooseVideoFolders));
+        save("setup");
+    }
+}
+
 void verifySize(int width, int height, const std::filesystem::path& output) {
     SDL_Surface* surface = SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32);
     SDL_Renderer* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
@@ -529,10 +722,11 @@ void verifySize(int width, int height, const std::filesystem::path& output) {
             CHECK(actionAt(ui, addX, controlY, neon::UiActionKind::AddSelected));
             CHECK(actionAt(ui, nextX, 992, neon::UiActionKind::PageNext));
             const float navigationY = retro ? 71.0F : 53.0F;
-            CHECK(actionAt(ui, retro ? 318.0F : 430.0F, navigationY, neon::UiActionKind::OpenKeyboard));
-            CHECK(actionAt(ui, retro ? 786.0F : 1082.0F, navigationY, neon::UiActionKind::ToggleGenreMenu));
-            CHECK(actionAt(ui, retro ? 1077.0F : 1470.0F, navigationY, neon::UiActionKind::ShowMusic));
-            CHECK(actionAt(ui, retro ? 1279.0F : 1754.0F, navigationY, neon::UiActionKind::ShowVideo));
+            CHECK(actionAt(ui, retro ? 268.0F : 375.0F, navigationY, neon::UiActionKind::OpenKeyboard));
+            CHECK(actionAt(ui, retro ? 696.0F : 957.0F, navigationY, neon::UiActionKind::ToggleGenreMenu));
+            CHECK(actionAt(ui, retro ? 978.0F : 1306.0F, navigationY, neon::UiActionKind::ShowMusic));
+            CHECK(actionAt(ui, retro ? 1138.0F : 1542.0F, navigationY, neon::UiActionKind::ShowVideo));
+            CHECK(actionAt(ui, retro ? 1298.0F : 1778.0F, navigationY, neon::UiActionKind::ShowRadio));
             save(definition.id);
             model.visualizerMode = neon::VisualizerMode::NeonMosaic;
             ui.render(model);
@@ -639,7 +833,7 @@ void verifySize(int width, int height, const std::filesystem::path& output) {
             model.genreMenuOpen = true;
             ui.render(model);
             CHECK(actionAt(ui, cardX, cardY, neon::UiActionKind::CloseGenreMenu));
-            CHECK(actionAt(ui, retro ? 786.0F : 1020.0F, retro ? 190.0F : 172.0F, neon::UiActionKind::SelectGenre, 0));
+            CHECK(actionAt(ui, retro ? 696.0F : 957.0F, retro ? 190.0F : 172.0F, neon::UiActionKind::SelectGenre, 0));
             save(retro ? "retro-genres" : "neon-genres");
             model.genreMenuOpen = false;
             model.keyboardOpen = true;
@@ -798,6 +992,7 @@ void verifySize(int width, int height, const std::filesystem::path& output) {
         CHECK(!ui.hitTest(1770, 1017));
         save("retro-empty");
     }
+    verifyRadio(renderer, surface, output);
     SDL_DestroyRenderer(renderer);
     SDL_DestroySurface(surface);
 }
@@ -1375,6 +1570,25 @@ int main(int argc, char** argv) {
     CHECK(neon::pageAfterThemeChange(Theme::Retro, Theme::Neon, 99, 0) == 0);
     CHECK(neon::pageAfterThemeChange(Theme::Neon, Theme::Retro, 99, 21) == 0);
     if (!SDL_Init(SDL_INIT_VIDEO) || !TTF_Init()) { std::cerr << SDL_GetError(); return 1; }
+    if (argc == 3 && std::string_view(argv[1]) == "--preview-radio") {
+        const auto output = neon::pathFromUtf8(argv[2]);
+        std::filesystem::create_directories(output);
+        for (const auto size : {SDL_Point{1920, 1080}, SDL_Point{1280, 720}, SDL_Point{1024, 768}}) {
+            auto* surface = SDL_CreateSurface(size.x, size.y, SDL_PIXELFORMAT_RGBA32);
+            auto* renderer = surface ? SDL_CreateSoftwareRenderer(surface) : nullptr;
+            CHECK(renderer);
+            if (renderer) {
+                CHECK(SDL_SetRenderLogicalPresentation(renderer, 1920, 1080, SDL_LOGICAL_PRESENTATION_LETTERBOX));
+                verifyRadio(renderer, surface, output);
+                SDL_DestroyRenderer(renderer);
+            }
+            SDL_DestroySurface(surface);
+        }
+        TTF_Quit();
+        SDL_Quit();
+        std::cout << "Radio UI checks: " << failures << " failures\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 3 && std::string_view(argv[1]) == "--preview-video-info") {
         verifyVideoInfo(neon::pathFromUtf8(argv[2]));
         TTF_Quit();

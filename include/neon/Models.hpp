@@ -17,8 +17,8 @@ namespace neon {
 enum class ArtworkSource { Embedded, Sidecar, Online, Generated };
 enum class PlaybackState { Stopped, Playing, Paused, Error };
 enum class AmbientMode { Off, Sequential, Shuffle };
-enum class MediaKind { Music, Video };
-enum class LibraryFilter { All, Music, Video, Favorites };
+enum class MediaKind { Music, Video, Radio };
+enum class LibraryFilter { All, Music, Video, Favorites, Radio };
 enum class NowPlayingArtworkMode { Artwork, SpinningDisc };
 enum class VisualizerMode {
     AuroraSpectrum,
@@ -97,6 +97,7 @@ struct Track {
     std::optional<std::filesystem::path> sidecarArtwork;
     std::optional<std::filesystem::path> onlineArtwork;
     MediaKind mediaKind{MediaKind::Music};
+    std::string streamUrl;
 };
 
 struct QueueItem {

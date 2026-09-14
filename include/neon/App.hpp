@@ -19,6 +19,8 @@
 #include "neon/Library.hpp"
 #include "neon/OnlineArtwork.hpp"
 #include "neon/Queue.hpp"
+#include "neon/Radio.hpp"
+#include "neon/RadioDirectory.hpp"
 #include "neon/Security.hpp"
 #include "neon/Storage.hpp"
 #include "neon/UI.hpp"
@@ -54,6 +56,8 @@ private:
     void startScan(std::vector<std::filesystem::path> musicRoots,
                    std::vector<std::filesystem::path> videoRoots);
     void processScan();
+    void startRadioFetch();
+    void processRadioFetch();
     void startArtworkFetch();
     void processArtworkFetch();
     void prepareLibraryArtwork(std::span<const Track> tracks);
@@ -63,6 +67,7 @@ private:
     bool playTrack(const Track& track, std::int64_t startMs, std::string& error);
     void stopPlayback();
     [[nodiscard]] bool currentIsVideo() const;
+    [[nodiscard]] bool currentIsRadio() const;
     void startNextTrack();
     const Track* nextAmbientTrack();
     void prepareNextAmbientVideo();
@@ -85,6 +90,7 @@ private:
     UI ui_;
     AudioEngine audio_;
     VideoEngine video_;
+    RadioEngine radio_;
     LibraryArtworkPreparer artworkPreparer_;
     bool artworkPreparationStopped_{};
     std::unique_ptr<Storage> storage_;
@@ -131,6 +137,11 @@ private:
     std::vector<Track> scanTrackUpdates_;
     bool scanCacheDirty_{};
     bool scanning_{};
+    std::future<RadioDirectoryResult> radioFuture_;
+    std::atomic_bool radioCancel_{};
+    bool radioFetching_{};
+    std::string radioStatus_;
+    std::uint64_t radioFetchedAt_{};
     struct ScanRequest {
         std::vector<std::filesystem::path> musicRoots;
         std::vector<std::filesystem::path> videoRoots;

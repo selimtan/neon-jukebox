@@ -119,6 +119,7 @@ add_library(neon_core
     src/SingleInstance.cpp
     src/Library.cpp
     src/HttpRequest.cpp
+    src/RadioDirectory.cpp
     src/VideoSourceCache.cpp
     src/OnlineArtwork.cpp)
 target_include_directories(neon_core PUBLIC include)
@@ -141,6 +142,7 @@ add_executable(neon_jukebox WIN32
     src/main.cpp
     src/App.cpp
     src/Audio.cpp
+    src/Radio.cpp
     src/Video.cpp
     src/UI.cpp
     src/UIRetro.cpp
@@ -164,7 +166,7 @@ target_link_libraries(neon_jukebox PRIVATE
     SDL3_mixer::SDL3_mixer-static
     SDL3_image::SDL3_image-static
     SDL3_ttf::SDL3_ttf-static
-    mfplay mfplat mfreadwrite mfuuid propsys ole32 oleaut32 uuid shell32 gdi32)
+    mfplay mfplat mfreadwrite mfuuid propsys ole32 oleaut32 uuid shell32 gdi32 windowsapp)
 if(MSVC)
     target_compile_options(neon_jukebox PRIVATE /W4 /permissive- /utf-8)
     target_link_options(neon_jukebox PRIVATE /SUBSYSTEM:WINDOWS)
@@ -203,7 +205,7 @@ if(NEON_BUILD_TESTING)
     set_tests_properties(neon_single_instance_tests PROPERTIES TIMEOUT 45)
 
     add_executable(neon_scan_tests tests/test_scan.cpp
-        src/App.cpp src/Audio.cpp src/Video.cpp src/UI.cpp src/UIRetro.cpp
+        src/App.cpp src/Audio.cpp src/Radio.cpp src/Video.cpp src/UI.cpp src/UIRetro.cpp
         src/Visualizer.cpp src/Artwork.cpp src/VideoThumbnail.cpp src/ArtworkPreparation.cpp)
     target_include_directories(neon_scan_tests PRIVATE include)
     target_compile_definitions(neon_scan_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
@@ -211,7 +213,7 @@ if(NEON_BUILD_TESTING)
         NEON_EFFECT_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/retro")
     target_link_libraries(neon_scan_tests PRIVATE neon_core SDL3::SDL3-static
         SDL3_mixer::SDL3_mixer-static SDL3_image::SDL3_image-static SDL3_ttf::SDL3_ttf-static
-        mfplay mfplat mfreadwrite mfuuid propsys ole32 oleaut32 uuid shell32 gdi32)
+        mfplay mfplat mfreadwrite mfuuid propsys ole32 oleaut32 uuid shell32 gdi32 windowsapp)
     if(MSVC)
         target_compile_options(neon_scan_tests PRIVATE /W4 /permissive- /utf-8)
     endif()
@@ -233,6 +235,20 @@ if(NEON_BUILD_TESTING)
     target_link_libraries(neon_tests PRIVATE neon_core)
     target_compile_definitions(neon_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
     add_test(NAME neon_core_tests COMMAND neon_tests)
+    add_executable(neon_radio_tests tests/test_radio.cpp)
+    target_link_libraries(neon_radio_tests PRIVATE neon_core)
+    if(MSVC)
+        target_compile_options(neon_radio_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_radio_directory_tests COMMAND neon_radio_tests)
+
+    add_executable(neon_radio_playback_tests tests/test_radio_playback.cpp src/Radio.cpp)
+    target_link_libraries(neon_radio_playback_tests PRIVATE neon_core windowsapp ole32 ws2_32)
+    if(MSVC)
+        target_compile_options(neon_radio_playback_tests PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME neon_radio_playback_tests COMMAND neon_radio_playback_tests)
+    set_tests_properties(neon_radio_playback_tests PROPERTIES TIMEOUT 90)
     add_executable(neon_shutdown_io_tests tests/test_shutdown_io.cpp)
     target_link_libraries(neon_shutdown_io_tests PRIVATE neon_core ws2_32)
     add_test(NAME neon_shutdown_io_tests COMMAND neon_shutdown_io_tests)
@@ -315,7 +331,7 @@ install(DIRECTORY assets/ DESTINATION assets COMPONENT Application
         PATTERN "DSEG*" EXCLUDE)
 install(FILES README.md LICENSE THIRD_PARTY_NOTICES.md DESTINATION . COMPONENT Application)
 install(FILES scripts/Install-Jukebox.ps1 DESTINATION . COMPONENT Application)
-install(FILES docs/VISUALIZER_RESEARCH.md docs/ARTWORK_SOURCES.md docs/THEMES.md docs/KIOSK_SETUP.md DESTINATION docs COMPONENT Application)
+install(FILES docs/VISUALIZER_RESEARCH.md docs/ARTWORK_SOURCES.md docs/THEMES.md docs/KIOSK_SETUP.md docs/RADIO.md DESTINATION docs COMPONENT Application)
 install(FILES "${sdl3_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses
         RENAME SDL3-LICENSE.txt COMPONENT Application)
 install(FILES "${sdl3_mixer_SOURCE_DIR}/LICENSE.txt" DESTINATION licenses

@@ -89,10 +89,12 @@ VisualizerMode visualizerFromString(std::string_view value) {
 }
 
 std::string mediaKindToString(MediaKind kind) {
+    if (kind == MediaKind::Radio) return "radio";
     return kind == MediaKind::Video ? "video" : "music";
 }
 
 MediaKind mediaKindFromString(std::string_view value) {
+    if (value == "radio") return MediaKind::Radio;
     return value == "video" ? MediaKind::Video : MediaKind::Music;
 }
 
@@ -139,7 +141,7 @@ void to_json(nlohmann::json& json, const Track& track) {
         {"trackNumber", track.trackNumber}, {"fileSize", track.fileSize},
         {"modifiedTicks", track.modifiedTicks}, {"favorite", track.favorite},
         {"hasEmbeddedArtwork", track.hasEmbeddedArtwork},
-        {"mediaKind", mediaKindToString(track.mediaKind)}
+        {"mediaKind", mediaKindToString(track.mediaKind)}, {"streamUrl", track.streamUrl}
     };
     if (track.sidecarArtwork) json["sidecarArtwork"] = pathToUtf8(*track.sidecarArtwork);
     if (track.onlineArtwork) json["onlineArtwork"] = pathToUtf8(*track.onlineArtwork);
@@ -160,6 +162,7 @@ void from_json(const nlohmann::json& json, Track& track) {
     track.favorite = json.value("favorite", false);
     track.hasEmbeddedArtwork = json.value("hasEmbeddedArtwork", false);
     track.mediaKind = mediaKindFromString(json.value("mediaKind", "music"));
+    track.streamUrl = json.value("streamUrl", "");
     if (json.contains("sidecarArtwork")) track.sidecarArtwork = pathFromUtf8(json.at("sidecarArtwork").get<std::string>());
     if (json.contains("onlineArtwork")) track.onlineArtwork = pathFromUtf8(json.at("onlineArtwork").get<std::string>());
 }
@@ -192,7 +195,7 @@ void to_json(nlohmann::json& json, const Settings& settings) {
         {"adminPin", settings.adminPin}, {"volume", settings.volume},
         {"ambientMode", ambientToString(settings.ambientMode)}, {"ambientRepeat", settings.ambientRepeat},
         {"ambientMediaKind", settings.ambientMediaKind
-            ? (*settings.ambientMediaKind == MediaKind::Video ? "video" : "music") : "all"},
+            ? mediaKindToString(*settings.ambientMediaKind) : "all"},
         {"playbackPositionMs", settings.playbackPositionMs}, {"currentTrackId", settings.currentTrackId},
         {"playbackWasActive", settings.playbackWasActive},
         {"currentTrackManual", settings.currentTrackManual},
@@ -223,6 +226,7 @@ void from_json(const nlohmann::json& json, Settings& settings) {
     if (ambientMedia != json.end() && ambientMedia->is_string()) {
         if (*ambientMedia == "music") settings.ambientMediaKind = MediaKind::Music;
         else if (*ambientMedia == "video") settings.ambientMediaKind = MediaKind::Video;
+        else if (*ambientMedia == "radio") settings.ambientMediaKind = MediaKind::Radio;
     }
     settings.playbackPositionMs = json.value("playbackPositionMs", std::int64_t{});
     settings.currentTrackId = json.value("currentTrackId", "");

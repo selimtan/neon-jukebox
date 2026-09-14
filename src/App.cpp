@@ -18,6 +18,11 @@ namespace neon {
 namespace {
 constexpr std::size_t noSelection = static_cast<std::size_t>(-1);
 
+LibraryFilter filterForMedia(MediaKind kind) {
+    if (kind == MediaKind::Radio) return LibraryFilter::Radio;
+    return kind == MediaKind::Video ? LibraryFilter::Video : LibraryFilter::Music;
+}
+
 std::vector<std::filesystem::path> uniqueRoots(
     const std::vector<std::filesystem::path>& roots) {
     std::vector<std::filesystem::path> result;
@@ -109,8 +114,7 @@ bool App::initialize(std::string& error) {
             settings_.ambientMediaKind = previous->mediaKind;
     }
     if (settings_.ambientMediaKind) {
-        libraryFilter_ = *settings_.ambientMediaKind == MediaKind::Video
-            ? LibraryFilter::Video : LibraryFilter::Music;
+        libraryFilter_ = filterForMedia(*settings_.ambientMediaKind);
     }
     settings_.musicRoots = uniqueRoots(settings_.musicRoots);
     settings_.videoRoots = uniqueRoots(settings_.videoRoots);
@@ -134,11 +138,13 @@ bool App::initialize(std::string& error) {
     video_.setVolume(settings_.volume);
 
     if (!settings_.adminPin.configured()) mode_ = UiMode::SetupPin;
-    else if (settings_.musicRoots.empty() && settings_.videoRoots.empty()) mode_ = UiMode::SetupFolder;
+    else if (settings_.musicRoots.empty() && settings_.videoRoots.empty() &&
+             settings_.ambientMediaKind != MediaKind::Radio) mode_ = UiMode::SetupFolder;
     else mode_ = UiMode::Browse;
     updateFilter();
 
     if (mode_ == UiMode::Browse) {
+        if (libraryFilter_ == LibraryFilter::Radio) startRadioFetch();
         if (settings_.playbackWasActive && !settings_.currentTrackId.empty()) {
             if (const Track* track = LibraryScanner::find(library_, settings_.currentTrackId)) {
                 std::string playError;
@@ -173,6 +179,7 @@ bool App::initialize(std::string& error) {
 void App::shutdown() {
     if (!initialized_ && !sdlInitialized_ && !ttfInitialized_ && !window_ && !renderer_) return;
     scanCancel_.store(true, std::memory_order_release);
+    radioCancel_.store(true, std::memory_order_release);
     pendingScan_.reset();
     artworkCancel_.store(true, std::memory_order_release);
     artworkRestartPending_ = false;
@@ -183,13 +190,14 @@ void App::shutdown() {
     // cancelling together, including when a slow drive or provider is pending.
     persistPlayback();
     video_.requestShutdown();
+    radio_.shutdown();
     if (window_) SDL_HideWindow(window_);
     audio_.shutdown(); // Device mixer destruction belongs on the SDL main thread.
     waitWithWindowMessages([this] {
         const auto ready = [](const auto& future) {
             return !future.valid() || future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
         };
-        return ready(scanFuture_) && ready(artworkFuture_);
+        return ready(scanFuture_) && ready(artworkFuture_) && ready(radioFuture_);
     });
     processScanTrackUpdates();
     processArtworkFetch();
@@ -352,12 +360,31 @@ void App::dispatch(const UiAction& action) {
             if (credits_.available() == 0) {
                 setToast("Insert a coin to request a track");
             } else if (const auto* track = selectedTrack()) {
+                if (track->mediaKind == MediaKind::Radio) {
+                    // A live station has no end, so listening is an immediate
+                    // selection instead of an item that would block the queue.
+                    const auto station = *track;
+                    std::string error;
+                    if (playTrack(station, 0, error)) {
+                        currentTrackId_ = station.id;
+                        currentIsManual_ = false;
+                        (void)credits_.consume();
+                        playNowPrompt_ = false;
+                        requestedTrackTitle_.clear();
+                        persistPlayback();
+                        setToast(station.title + " radyosuna bağlanılıyor...");
+                    } else setToast("Radyo açılamadı: " + error, 6000);
+                    break;
+                }
                 const bool backgroundPlaying = !currentTrackId_.empty() && !currentIsManual_;
                 const bool requestQueueWasEmpty = queue_.empty();
                 queue_.enqueue(track->id);
                 (void)credits_.consume();
                 storage_->saveQueue(queue_.snapshot());
-                if (currentTrackId_.empty()) {
+                if (currentIsRadio()) {
+                    // A queued song must not wait for a live broadcast to end.
+                    skipCurrent();
+                } else if (currentTrackId_.empty()) {
                     setToast(track->title + " is playing now");
                     startNextTrack();
                 } else if (shouldOfferPlayNow(backgroundPlaying, requestQueueWasEmpty)) {
@@ -404,6 +431,9 @@ void App::dispatch(const UiAction& action) {
             break;
         case UiActionKind::ShowVideo:
             if (credits_.available() > 0) selectLibraryMedia(MediaKind::Video);
+            break;
+        case UiActionKind::ShowRadio:
+            if (credits_.available() > 0) selectLibraryMedia(MediaKind::Radio);
             break;
         case UiActionKind::OpenKeyboard:
             if (credits_.available() > 0) {
@@ -483,7 +513,7 @@ void App::dispatch(const UiAction& action) {
         case UiActionKind::ChooseMusicFolders: showFolderDialog(MediaKind::Music, true); break;
         case UiActionKind::ChooseVideoFolders: showFolderDialog(MediaKind::Video, true); break;
         case UiActionKind::FinishFolderSetup:
-            if (!settings_.musicRoots.empty() || !settings_.videoRoots.empty()) {
+            {
                 library_ = {};
                 library_.musicRoots = settings_.musicRoots;
                 library_.videoRoots = settings_.videoRoots;
@@ -493,6 +523,8 @@ void App::dispatch(const UiAction& action) {
                 rebuildGenres();
                 updateFilter();
                 startScan(settings_.musicRoots, settings_.videoRoots);
+                if (settings_.musicRoots.empty() && settings_.videoRoots.empty())
+                    selectLibraryMedia(MediaKind::Radio);
             }
             break;
         case UiActionKind::PagePrevious:
@@ -503,7 +535,9 @@ void App::dispatch(const UiAction& action) {
             break;
         case UiActionKind::AdminClose: videoFullscreen_ = false; mode_ = UiMode::Browse; break;
         case UiActionKind::AdminPlayPause:
-            if (currentIsVideo()) {
+            if (currentIsRadio()) {
+                if (radio_.paused()) radio_.resume(); else radio_.pause();
+            } else if (currentIsVideo()) {
                 if (video_.paused()) video_.resume(); else video_.pause();
             } else {
                 if (audio_.paused()) audio_.resume(); else audio_.pause();
@@ -511,12 +545,14 @@ void App::dispatch(const UiAction& action) {
             break;
         case UiActionKind::AdminSkip: skipCurrent(); break;
         case UiActionKind::AdminSeekBackward: {
+            if (currentIsRadio()) break;
             const auto snapshot = playbackSnapshot();
             const auto position = std::max<std::int64_t>(0, snapshot.positionMs - 15000);
             if (currentIsVideo()) video_.seek(position); else audio_.seek(position);
             break;
         }
         case UiActionKind::AdminSeekForward: {
+            if (currentIsRadio()) break;
             const auto snapshot = playbackSnapshot();
             const auto position = std::min(snapshot.durationMs, snapshot.positionMs + 15000);
             if (currentIsVideo()) video_.seek(position); else audio_.seek(position);
@@ -524,13 +560,16 @@ void App::dispatch(const UiAction& action) {
         }
         case UiActionKind::AdminVolumeDown:
             settings_.volume = std::max(0.0F, settings_.volume - 0.1F);
-            audio_.setVolume(settings_.volume); video_.setVolume(settings_.volume); persistPlayback(); break;
+            audio_.setVolume(settings_.volume); video_.setVolume(settings_.volume);
+            radio_.setVolume(settings_.volume); persistPlayback(); break;
         case UiActionKind::AdminVolumeUp:
             settings_.volume = std::min(1.0F, settings_.volume + 0.1F);
-            audio_.setVolume(settings_.volume); video_.setVolume(settings_.volume); persistPlayback(); break;
+            audio_.setVolume(settings_.volume); video_.setVolume(settings_.volume);
+            radio_.setVolume(settings_.volume); persistPlayback(); break;
         case UiActionKind::AdminClearQueue:
             queue_.clear(); adminQueueSelection_ = noSelection; storage_->saveQueue(queue_.snapshot()); setToast("Queue cleared"); break;
         case UiActionKind::AdminRescan:
+            if (libraryFilter_ == LibraryFilter::Radio) startRadioFetch();
             if (!settings_.musicRoots.empty() || !settings_.videoRoots.empty())
                 startScan(settings_.musicRoots, settings_.videoRoots);
             break;
@@ -619,6 +658,7 @@ void App::dispatch(const UiAction& action) {
 void App::update() {
     processFolderResult();
     processScan();
+    processRadioFetch();
     processArtworkFetch();
     finishPendingPage();
     for (const auto& track : artworkPreparer_.takeCompleted()) ui_.refreshArtwork(track);
@@ -632,7 +672,15 @@ void App::update() {
         std::ofstream log(storage_->root() / L"jukebox.log", std::ios::binary | std::ios::app);
         log << nowUnixMs() << "  video  " << currentTrackId_ << "  " << error << '\n';
     }
-    if (audio_.takeFinished() || video_.takeFinished()) {
+    if (const auto error = radio_.takeError(); !error.empty()) {
+        setToast("Radyo yayını açılamadı. Başka bir istasyon seçebilirsiniz.", 6000);
+        if (storage_) {
+            std::ofstream log(storage_->root() / L"jukebox.log", std::ios::binary | std::ios::app);
+            log << nowUnixMs() << "  radio  " << currentTrackId_ << "  " << error << '\n';
+        }
+    }
+    const bool radioFinished = radio_.takeFinished();
+    if (audio_.takeFinished() || video_.takeFinished() || radioFinished) {
         playNowPrompt_ = false;
         requestedTrackTitle_.clear();
         stopPlayback();
@@ -668,7 +716,8 @@ void App::render() {
     model.selectedTrack = selectedTrack();
     model.playback = playbackSnapshot();
     if (SDL_GetTicks() - lastSpectrumUpdate_ >= 33) {
-        visualization_ = currentIsVideo() ? video_.visualization() : audio_.visualization();
+        visualization_ = currentIsRadio() ? AudioVisualizationFrame{} :
+            currentIsVideo() ? video_.visualization() : audio_.visualization();
         lastSpectrumUpdate_ = SDL_GetTicks();
     }
     model.visualization = visualization_;
@@ -691,6 +740,9 @@ void App::render() {
     model.videoFullscreen = videoFullscreen_;
     model.videoPlaying = currentIsVideo();
     if (model.videoPlaying) model.videoLoadingStatus = video_.loadingStatus();
+    model.radioFetching = radioFetching_;
+    model.radioStatus = radioStatus_;
+    if (currentIsRadio() && radio_.loading()) model.radioLoadingStatus = "RADYOYA BAĞLANILIYOR...";
     model.credits = credits_.available();
     model.playNowPrompt = playNowPrompt_;
     model.requestedTrackTitle = requestedTrackTitle_;
@@ -765,7 +817,10 @@ void App::finishPendingPage() {
 
 void App::selectLibraryMedia(MediaKind kind) {
     genreMenuOpen_ = false;
-    libraryFilter_ = kind == MediaKind::Video ? LibraryFilter::Video : LibraryFilter::Music;
+    if (kind == MediaKind::Radio || libraryFilter_ == LibraryFilter::Radio) selectedGenre_.clear();
+    libraryFilter_ = filterForMedia(kind);
+    if (kind == MediaKind::Radio && (!radioFetchedAt_ ||
+        SDL_GetTicks() - radioFetchedAt_ > 60 * 60 * 1000)) startRadioFetch();
     // Playback focus may temporarily reveal an older request from the other
     // section; only an explicit section choice changes the ambient pool.
     if (settings_.ambientMediaKind != kind) {
@@ -801,7 +856,7 @@ void App::updateFilter(bool resetPage) {
 void App::focusLibraryTrack(std::size_t libraryIndex) {
     if (libraryIndex >= library_.tracks.size()) return;
     // Preserve active artist browsing while the visitor can still request songs.
-    if (selectedArtistInitial_ && credits_.available() > 0) return;
+    if ((selectedArtistInitial_ || libraryFilter_ == LibraryFilter::Radio) && credits_.available() > 0) return;
 
     pendingPage_.reset();
     selectedIndex_ = libraryIndex;
@@ -812,9 +867,9 @@ void App::focusLibraryTrack(std::size_t libraryIndex) {
         searchDraft_.clear();
         selectedGenre_.clear();
         selectedArtistInitial_ = '\0';
-        if (libraryFilter_ == LibraryFilter::Music || libraryFilter_ == LibraryFilter::Video) {
-            libraryFilter_ = library_.tracks[libraryIndex].mediaKind == MediaKind::Video
-                ? LibraryFilter::Video : LibraryFilter::Music;
+        if (libraryFilter_ == LibraryFilter::Music || libraryFilter_ == LibraryFilter::Video ||
+            libraryFilter_ == LibraryFilter::Radio) {
+            libraryFilter_ = filterForMedia(library_.tracks[libraryIndex].mediaKind);
         } else {
             libraryFilter_ = LibraryFilter::All;
         }
@@ -961,6 +1016,11 @@ void App::processScan() {
             const auto current = currentById.find(track.id);
             if (current != currentById.end()) preserveEnrichedMetadata(track, *current->second);
         }
+        // Local source scans cannot discover web stations. Preserve the latest
+        // radio catalogue, including refreshes completed during the scan.
+        for (const auto& track : library_.tracks) {
+            if (track.mediaKind == MediaKind::Radio) scannedLibrary.tracks.push_back(track);
+        }
         library_ = std::move(scannedLibrary);
         ambientSelector_.reset();
         rebuildGenres();
@@ -980,6 +1040,65 @@ void App::processScan() {
         setToast(std::string("Library scan failed: ") + exception.what(), 6000);
     }
     scanning_ = false;
+}
+
+void App::startRadioFetch() {
+    if (radioFetching_ || !storage_) return;
+    radioCancel_.store(false, std::memory_order_release);
+    radioStatus_.clear();
+    radioFetching_ = true;
+    try {
+        radioFuture_ = std::async(std::launch::async, [this] {
+            return RadioDirectory{}.fetchTurkey(&radioCancel_);
+        });
+    } catch (...) {
+        radioFetching_ = false;
+        radioStatus_ = "Radyo listesi yüklenemedi. RADYO'ya basarak tekrar deneyin.";
+    }
+}
+
+void App::processRadioFetch() {
+    if (!radioFetching_ || !radioFuture_.valid() ||
+        radioFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    radioFetching_ = false;
+    RadioDirectoryResult result;
+    try { result = radioFuture_.get(); }
+    catch (...) { result.error = "Radio directory request failed"; }
+    if (radioCancel_.load(std::memory_order_acquire)) return;
+    if (!result.error.empty() || result.tracks.empty()) {
+        radioFetchedAt_ = 0; // Selecting RADYO again retries even with a recent cache.
+        const bool cached = std::ranges::any_of(library_.tracks,
+            [](const Track& track) { return track.mediaKind == MediaKind::Radio; });
+        radioStatus_ = cached ? "Radyo listesi güncellenemedi. Kayıtlı istasyonlar gösteriliyor."
+            : "Radyo listesi yüklenemedi. İnterneti kontrol edip RADYO'ya tekrar basın.";
+        if (libraryFilter_ == LibraryFilter::Radio) setToast(radioStatus_, 6000);
+        return;
+    }
+
+    const std::string selectedId = selectedTrack() ? selectedTrack()->id : std::string{};
+    std::optional<Track> activeStation;
+    if (currentIsRadio()) activeStation = *currentTrack();
+    std::unordered_set<std::string> favorites;
+    for (const auto& track : library_.tracks)
+        if (track.mediaKind == MediaKind::Radio && track.favorite) favorites.insert(track.id);
+    std::erase_if(library_.tracks, [](const Track& track) { return track.mediaKind == MediaKind::Radio; });
+    for (auto& track : result.tracks) {
+        track.favorite = favorites.contains(track.id);
+        library_.tracks.push_back(std::move(track));
+    }
+    // Removing an entry from the directory must not detach an active broadcast.
+    if (activeStation && !LibraryScanner::find(library_, activeStation->id))
+        library_.tracks.push_back(std::move(*activeStation));
+    selectedIndex_.reset();
+    for (std::size_t i = 0; i < library_.tracks.size(); ++i)
+        if (library_.tracks[i].id == selectedId) { selectedIndex_ = i; break; }
+    rebuildGenres();
+    updateFilter(false);
+    radioFetchedAt_ = std::max<std::uint64_t>(1, SDL_GetTicks());
+    radioStatus_.clear();
+    storage_->saveLibraryAsync(library_);
+    if (libraryFilter_ == LibraryFilter::Radio)
+        setToast(std::to_string(result.tracks.size()) + " Türkiye radyosu yüklendi");
 }
 
 void App::startArtworkFetch() {
@@ -1154,7 +1273,7 @@ void App::recoverAudio() {
     audio_.setVolume(settings_.volume);
     audioRecoveryPending_ = false;
     if (const auto* track = currentTrack()) {
-        if (track->mediaKind == MediaKind::Video) {
+        if (track->mediaKind == MediaKind::Video || track->mediaKind == MediaKind::Radio) {
             setToast("Audio device ready");
             return;
         }
@@ -1173,6 +1292,18 @@ void App::recoverAudio() {
 
 bool App::playTrack(const Track& track, std::int64_t startMs, std::string& error) {
     videoInfoStartedAt_.reset();
+    if (track.mediaKind == MediaKind::Radio) {
+        if (!radio_.initialized() && !radio_.initialize(error)) return false;
+        radio_.setVolume(settings_.volume);
+        if (!radio_.play(track, error)) return false;
+        audio_.stop();
+        video_.stop();
+        video_.cancelPreload();
+        nextAmbientVideo_.reset();
+        videoFullscreen_ = false;
+        return true;
+    }
+    radio_.stop();
     if (track.mediaKind == MediaKind::Video) {
         audio_.stop();
         video_.setVolume(settings_.volume);
@@ -1188,6 +1319,7 @@ bool App::playTrack(const Track& track, std::int64_t startMs, std::string& error
 void App::stopPlayback() {
     audio_.stop();
     video_.stop();
+    radio_.stop();
     // A clip transition keeps the visitor's video display choice.
 }
 
@@ -1202,11 +1334,19 @@ bool App::currentIsVideo() const {
     return track && track->mediaKind == MediaKind::Video;
 }
 
+bool App::currentIsRadio() const {
+    const auto* track = currentTrack();
+    return track && track->mediaKind == MediaKind::Radio;
+}
+
 const Track* App::nextAmbientTrack() {
+    // Live stations are explicitly chosen and never enter music/video shuffle.
+    if (settings_.ambientMediaKind == MediaKind::Radio) return nullptr;
     // Search, genre and artist filters affect browsing, not the shuffle pool.
     std::vector<std::size_t> candidates;
     candidates.reserve(library_.tracks.size());
     for (std::size_t i = 0; i < library_.tracks.size(); ++i) {
+        if (library_.tracks[i].mediaKind == MediaKind::Radio) continue;
         if (!settings_.ambientMediaKind || library_.tracks[i].mediaKind == *settings_.ambientMediaKind)
             candidates.push_back(i);
     }
@@ -1269,7 +1409,7 @@ void App::startNextTrack() {
             if (!next) break;
         }
         // Video opening and filesystem access belong to the media worker.
-        if (!next || (next->mediaKind != MediaKind::Video && !std::filesystem::exists(next->path))) continue;
+        if (!next || (next->mediaKind == MediaKind::Music && !std::filesystem::exists(next->path))) continue;
         std::string error;
         if (playTrack(*next, 0, error)) {
             currentTrackId_ = next->id;
@@ -1295,12 +1435,13 @@ void App::skipCurrent() {
 void App::persistPlayback() {
     if (!storage_) return;
     const bool video = currentIsVideo();
-    settings_.volume = video ? video_.volume() : audio_.volume();
+    const bool radio = currentIsRadio();
+    settings_.volume = radio ? radio_.volume() : video ? video_.volume() : audio_.volume();
     settings_.currentTrackId = currentTrackId_;
-    settings_.playbackPositionMs = video ? video_.positionMs() :
+    settings_.playbackPositionMs = radio ? 0 : video ? video_.positionMs() :
         audioRecoveryPending_ ? recoveryPositionMs_ : audio_.positionMs();
     settings_.playbackWasActive = !currentTrackId_.empty() &&
-        (video ? video_.playing() && !video_.paused() :
+        (radio ? (radio_.playing() || radio_.loading()) && !radio_.paused() : video ? video_.playing() && !video_.paused() :
          audioRecoveryPending_ ? !recoveryPaused_ : audio_.playing() && !audio_.paused());
     settings_.currentTrackManual = currentIsManual_;
     storage_->saveSettingsAsync(settings_);
@@ -1320,6 +1461,11 @@ const Track* App::currentTrack() const { return LibraryScanner::find(library_, c
 PlaybackSnapshot App::playbackSnapshot() const {
     PlaybackSnapshot snapshot;
     snapshot.trackId = currentTrackId_;
+    if (currentIsRadio()) {
+        snapshot.volume = radio_.volume();
+        snapshot.state = radio_.paused() ? PlaybackState::Paused : PlaybackState::Playing;
+        return snapshot;
+    }
     const bool video = currentIsVideo();
     snapshot.positionMs = video ? video_.positionMs() : audio_.positionMs();
     snapshot.durationMs = video ? video_.durationMs() : audio_.durationMs();

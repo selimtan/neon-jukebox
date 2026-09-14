@@ -32,6 +32,96 @@ neon::Track track(std::string id, std::string title) {
 
 namespace neon {
 struct AppScanTest {
+    static void verifyRadioCatalogue(Theme theme, const std::filesystem::path& stateRoot) {
+        CHECK(SDL_Init(SDL_INIT_AUDIO | SDL_INIT_EVENTS));
+        SDL_Delay(2);
+        App app;
+        app.sdlInitialized_ = true;
+        app.storage_ = std::make_unique<Storage>(stateRoot);
+        app.settings_.theme = theme;
+        app.mode_ = UiMode::Browse;
+        app.radioFetchedAt_ = SDL_GetTicks(); // Tests never contact the directory.
+        auto first = track("radio:one", "Metro FM");
+        first.mediaKind = MediaKind::Radio;
+        first.artist = "Turkey"; // A-Z must use the station name, not provider metadata.
+        first.path.clear();
+        first.streamUrl = "https://example.com/metro";
+        first.favorite = true;
+        auto second = first;
+        second.id = "radio:two";
+        second.title = "Şehir Radyo";
+        second.streamUrl = "https://example.com/sehir";
+        auto music = track("music", "Song");
+        app.library_.tracks = {music, first, second};
+        app.dispatch({UiActionKind::ShowRadio});
+        CHECK(app.libraryFilter_ == LibraryFilter::All); // Same coin rules as Music.
+        app.credits_.insert();
+        app.selectedGenre_ = "Rock";
+        app.dispatch({UiActionKind::ShowRadio});
+        CHECK(app.libraryFilter_ == LibraryFilter::Radio && app.filtered_.size() == 2);
+        CHECK(app.selectedGenre_.empty() && app.settings_.ambientMediaKind == MediaKind::Radio);
+        CHECK(!app.nextAmbientTrack()); // Live streams never start through shuffle.
+        app.dispatch({UiActionKind::SelectArtistInitial, 0, 'M'});
+        CHECK(app.filtered_.size() == 1 && app.library_.tracks[app.filtered_[0]].id == first.id);
+        app.dispatch({UiActionKind::SelectArtistInitial, 0, 'S'});
+        CHECK(app.filtered_.size() == 1 && app.library_.tracks[app.filtered_[0]].id == second.id);
+        app.dispatch({UiActionKind::SelectArtistInitial, 0, 'Z'});
+        CHECK(app.filtered_.empty());
+        app.dispatch({UiActionKind::SelectArtistInitial});
+        app.dispatch({UiActionKind::SelectTrack, 1});
+        CHECK(app.selectedTrack() && app.selectedTrack()->id == first.id);
+
+        // Directory refresh preserves local files, favorites and stable selection.
+        auto refreshed = first;
+        refreshed.favorite = false;
+        refreshed.streamUrl = "https://example.com/metro-new";
+        std::promise<RadioDirectoryResult> refresh;
+        app.radioFuture_ = refresh.get_future();
+        app.radioFetching_ = true;
+        refresh.set_value({{refreshed, second}, {}});
+        app.processRadioFetch();
+        CHECK(!app.radioFetching_ && app.library_.tracks.size() == 3);
+        CHECK(app.selectedTrack() && app.selectedTrack()->id == first.id && app.selectedTrack()->favorite);
+        CHECK(LibraryScanner::find(app.library_, first.id)->streamUrl == refreshed.streamUrl);
+        CHECK(app.storage_->loadLibrary().tracks.size() == 3);
+
+        // A failed directory fetch leaves the cached catalogue usable.
+        std::promise<RadioDirectoryResult> offline;
+        app.radioFuture_ = offline.get_future();
+        app.radioFetching_ = true;
+        offline.set_value({{}, "offline"});
+        app.processRadioFetch();
+        CHECK(!app.radioStatus_.empty() && app.filtered_.size() == 2);
+
+        // A simultaneous local scan cannot remove the refreshed web stations.
+        std::promise<LibraryIndex> localScan;
+        app.scanFuture_ = localScan.get_future();
+        app.scanning_ = true;
+        LibraryIndex localResult;
+        localResult.tracks = {music};
+        localScan.set_value(localResult);
+        app.processScan();
+        CHECK(app.library_.tracks.size() == 3 && app.filtered_.size() == 2);
+        CHECK(app.selectedTrack() && app.selectedTrack()->id == first.id);
+
+        // A station removed by a later directory response stays attached while playing.
+        app.currentTrackId_ = first.id;
+        std::promise<RadioDirectoryResult> removed;
+        app.radioFuture_ = removed.get_future();
+        app.radioFetching_ = true;
+        removed.set_value({{second}, {}});
+        app.processRadioFetch();
+        CHECK(app.currentIsRadio() && app.currentTrack()->id == first.id);
+        app.dispatch({UiActionKind::ShowMusic});
+        CHECK(app.filtered_.size() == 1 && app.library_.tracks[app.filtered_[0]].id == music.id);
+        app.selectedIndex_ = app.filtered_[0];
+        app.dispatch({UiActionKind::AddSelected});
+        CHECK(app.currentTrackId_ == music.id && app.audio_.playing());
+        CHECK(app.queue_.empty() && app.credits_.available() == 0);
+        app.settings_.ambientMediaKind.reset();
+        for (int i = 0; i < 5; ++i) CHECK(app.nextAmbientTrack()->id == music.id);
+    }
+
     static void verifyVideoFullscreen(Theme theme, const std::filesystem::path& stateRoot) {
         CHECK(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS));
         App app;
@@ -758,6 +848,8 @@ int main() {
     const auto root = std::filesystem::temp_directory_path() /
         neon::pathFromUtf8("neon-streaming-test-" + neon::randomId());
     try {
+        neon::AppScanTest::verifyRadioCatalogue(neon::Theme::Neon, root / "radio-neon");
+        neon::AppScanTest::verifyRadioCatalogue(neon::Theme::Retro, root / "radio-retro");
         neon::AppScanTest::verifyVideoFullscreen(neon::Theme::Neon, root / "fullscreen-modern");
         neon::AppScanTest::verifyVideoFullscreen(neon::Theme::Retro, root / "fullscreen-retro");
         neon::AppScanTest::verifyShutdown(root / "shutdown");

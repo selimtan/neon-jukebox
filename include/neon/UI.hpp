@@ -23,7 +23,7 @@ enum class UiActionKind {
     None, OpenAdmin, OpenVisualizer, VisualizerPrevious, VisualizerNext, CloseVisualizer,
     ToggleVideoFullscreen, InsertCoin, SelectTrack, AddSelected,
     ToggleGenreMenu, CloseGenreMenu, SelectGenre, GenrePagePrevious, GenrePageNext,
-    ShowMusic, ShowVideo, SelectArtistInitial, OpenKeyboard,
+    ShowMusic, ShowVideo, ShowRadio, SelectArtistInitial, OpenKeyboard,
     KeyCharacter, KeyBackspace, KeySpace, KeyClear, SubmitSearch, CloseKeyboard,
     PlayRequestNow, WaitForCurrentTrack,
     PinDigit, PinBackspace, PinSubmit, PinCancel,
@@ -71,6 +71,9 @@ struct UiModel {
     bool videoFullscreen{};
     bool videoPlaying{};
     std::string videoLoadingStatus;
+    bool radioFetching{};
+    std::string radioStatus;
+    std::string radioLoadingStatus;
     VisualizerMode visualizerMode{VisualizerMode::AuroraSpectrum};
     NowPlayingArtworkMode nowPlayingArtworkMode{NowPlayingArtworkMode::Artwork};
     std::size_t credits{};
@@ -95,7 +98,7 @@ struct UiModel {
     std::size_t videoSourceCount{};
 
     [[nodiscard]] bool buildingEmptyLibrary() const {
-        return scanning && (!library || library->tracks.empty()) &&
+        return libraryFilter != LibraryFilter::Radio && scanning && (!library || library->tracks.empty()) &&
             !selectedArtistInitial && search.empty() && selectedGenre.empty();
     }
 };
@@ -139,6 +142,8 @@ private:
     struct VisualizerTarget { SDL_Texture* texture{}; int width{}; int height{}; };
 
     void drawBrowse(const UiModel& model);
+    void drawRadioNotice(const UiModel& model, const SDL_FRect& rect);
+    static std::string radioSubtitle(const Track& track);
     void prepareArtwork(const UiModel& model);
     void drawRetroBrowse(const UiModel& model, std::uint64_t ticks);
     void drawRetroCards(const UiModel& model, bool enabled);

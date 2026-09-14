@@ -360,6 +360,7 @@ void UI::drawRetroCatalogue(const UiModel& model, bool enabled, std::uint64_t ti
             mix(model.libraryFilter == LibraryFilter::Video ? videoArtwork_.revision(track) : artwork_.revision(track));
             mix(index);
             mixText(track.id); mixText(track.title); mixText(track.artist);
+            mixText(track.genre); mixText(track.album);
             mix(static_cast<std::size_t>(track.durationMs)); mix(track.albumYear);
             mix(track.favorite); mix(static_cast<std::size_t>(track.mediaKind));
             mix(static_cast<std::size_t>(track.modifiedTicks)); mix(track.fileSize);
@@ -508,6 +509,8 @@ void UI::retroButton(const SDL_FRect& rect, std::string_view label, UiAction act
 }
 
 void UI::drawRetroStatus(const UiModel& model, std::uint64_t ticks) {
+    const bool radio = model.currentTrack && model.currentTrack->mediaKind == MediaKind::Radio;
+    const bool radioConnecting = !model.radioLoadingStatus.empty();
     constexpr std::uint64_t informationMs = 20000;
     constexpr std::uint64_t reminderMs = 5000;
     const std::string trackId = model.currentTrack ? model.currentTrack->id : "";
@@ -516,9 +519,10 @@ void UI::drawRetroStatus(const UiModel& model, std::uint64_t ticks) {
         retroStatusCycleTrack_ = trackId;
     }
     const auto phase = (ticks - *retroStatusCycleStart_) % (informationMs + reminderMs);
-    const bool coinPrompt = model.currentTrack && model.videoLoadingStatus.empty() && phase >= informationMs;
+    const bool coinPrompt = model.currentTrack && model.videoLoadingStatus.empty() &&
+        !radioConnecting && phase >= informationMs;
     const bool waiting = !model.currentTrack;
-    const std::string heading = waiting || coinPrompt ? "PLEASE" :
+    const std::string heading = radioConnecting ? "CONNECTING RADIO" : waiting || coinPrompt ? "PLEASE" :
         model.playback.state == PlaybackState::Paused ? "PAUSED" : "NOW PLAYING";
     const std::string message = coinPrompt ? "INSERT COIN" :
         model.currentTrack ? ellipsize(model.currentTrack->title, 31) :
@@ -564,18 +568,27 @@ void UI::drawRetroStatus(const UiModel& model, std::uint64_t ticks) {
     SDL_SetRenderClipRect(renderer_, clipped ? &previousClip : nullptr);
 
     if (model.currentTrack && !coinPrompt) {
-        text(ellipsize(model.currentTrack->artist, 36), 1658, 113, 21, green, 396, true, 24, true);
+        text(ellipsize(radio ? radioSubtitle(*model.currentTrack) : model.currentTrack->artist, 36),
+             1658, 113, 21, green, 396, true, 24, true);
         std::string album = model.currentTrack->album.empty() ? "—" : model.currentTrack->album;
         album = ellipsize(album, 35);
         if (model.currentTrack->albumYear > 0) album += " · " + std::to_string(model.currentTrack->albumYear);
         if (!model.videoLoadingStatus.empty()) album = model.videoLoadingStatus;
+        if (radio) album = "CANLI YAYIN · LIVE RADIO";
+        if (radioConnecting) album = model.radioLoadingStatus;
         text(album, 1658, 144, 17, dimGreen, 396, true, 22, true);
+    } else if (radioConnecting) {
+        text(model.radioLoadingStatus, 1658, 144, 17, green, 396, true, 22, true);
     }
     const auto duration = std::max<std::int64_t>(0, model.playback.durationMs);
     const auto position = std::clamp<std::int64_t>(model.playback.positionMs, 0, duration);
-    text(formatDuration(position), 1456, 174, 15, green, 90, false, 18, true);
-    text(duration > 0 ? formatDuration(duration) : "--:--", 1810, 174, 15, dimGreen, 54, false, 18, true);
-    const float playbackProgress = model.currentTrack && duration > 0
+    if (radio || radioConnecting) {
+        text(radioConnecting ? "CONNECTING" : "CANLI · LIVE", 1456, 174, 15, green, 404, false, 18, true);
+    } else {
+        text(formatDuration(position), 1456, 174, 15, green, 90, false, 18, true);
+        text(duration > 0 ? formatDuration(duration) : "--:--", 1810, 174, 15, dimGreen, 54, false, 18, true);
+    }
+    const float playbackProgress = !radio && !radioConnecting && model.currentTrack && duration > 0
         ? static_cast<float>(position) / static_cast<float>(duration) : 0;
     fill(renderer_, {1456, 198, 404, 8}, {7, 22, 11, 255});
     if (playbackProgress > 0) {
@@ -662,10 +675,11 @@ void UI::drawRetroCards(const UiModel& model, bool enabled) {
             const SDL_FRect cardArtwork{coverX, y + (cardHeight - 48) / 2, 48, 48};
             drawCover(track, cardArtwork);
             const float labelTextY = y + (cardHeight - 54) / 2;
-            text(ellipsize(uppercaseForDisplay(track->artist), 48), contentX + contentWidth / 2,
+            const bool station = track->mediaKind == MediaKind::Radio;
+            text(ellipsize(uppercaseForDisplay(station ? track->title : track->artist), 48), contentX + contentWidth / 2,
                  labelTextY, 26, ink, contentWidth, true, 28);
-            text(ellipsize(uppercaseForDisplay(track->title), 56), contentX + contentWidth / 2,
-                 labelTextY + 28, 24, ink, contentWidth, true, 26, false, true);
+            text(ellipsize(uppercaseForDisplay(station ? "CANLI · " + radioSubtitle(*track) : track->title), 56), contentX + contentWidth / 2,
+                 labelTextY + 28, station ? 21 : 24, station ? red : ink, contentWidth, true, 26, false, true);
             if (enabled) addHit(card, {UiActionKind::SelectTrack, index});
         } else {
             // Empty inserts retain their paper, divider and rail without fake selectors.
@@ -784,6 +798,9 @@ void UI::drawRetroBrowse(const UiModel& model, std::uint64_t ticks) {
     const bool enabled = unblocked && model.credits > 0;
     const std::size_t count = model.filtered ? model.filtered->size() : 0;
     const bool videos = model.libraryFilter == LibraryFilter::Video;
+    const bool radio = model.libraryFilter == LibraryFilter::Radio;
+    const bool currentRadio = model.currentTrack && model.currentTrack->mediaKind == MediaKind::Radio;
+    const bool radioConnecting = !model.radioLoadingStatus.empty();
     const auto capacity = themePageSize(Theme::Retro, videos);
     const std::size_t pages = std::max<std::size_t>(1, (count + capacity - 1) / capacity);
     const std::size_t page = std::min(model.page, pages - 1);
@@ -792,16 +809,17 @@ void UI::drawRetroBrowse(const UiModel& model, std::uint64_t ticks) {
     chrome({20, 20, 1384, 1040}, true);
     chrome({1418, 20, 480, 1040}, true);
 
-    retroButton({48, 40, 540, 62}, model.search.empty() ? "SEARCH TITLE / ARTIST / ALBUM" : ellipsize(model.search, 42),
+    retroButton({48, 40, 440, 62}, model.search.empty() ? (radio ? "SEARCH RADIO STATIONS" : "SEARCH TITLE / ARTIST / ALBUM") : ellipsize(model.search, 36),
                 {UiActionKind::OpenKeyboard}, enabled);
-    retroButton({604, 40, 364, 62}, model.selectedGenre.empty() ? "ALL GENRES  ▼" : ellipsize(model.selectedGenre, 26) + "  ▼",
+    retroButton({504, 40, 384, 62}, model.selectedGenre.empty() ? "ALL GENRES  ▼" : ellipsize(model.selectedGenre, 26) + "  ▼",
                 {UiActionKind::ToggleGenreMenu}, browse && model.credits > 0 &&
                 !model.keyboardOpen && !model.playNowPrompt && !model.visualizerOpen,
                 !model.selectedGenre.empty());
-    retroButton({984, 40, 186, 62}, "MUSIC", {UiActionKind::ShowMusic}, enabled,
+    retroButton({904, 40, 148, 62}, "MUSIC", {UiActionKind::ShowMusic}, enabled,
                 model.libraryFilter == LibraryFilter::Music);
-    retroButton({1186, 40, 186, 62}, "VIDEO", {UiActionKind::ShowVideo}, enabled,
+    retroButton({1064, 40, 148, 62}, "VIDEO", {UiActionKind::ShowVideo}, enabled,
                 model.libraryFilter == LibraryFilter::Video);
+    retroButton({1224, 40, 148, 62}, "RADYO", {UiActionKind::ShowRadio}, enabled, radio);
 
     // A separate artist index stays above both mechanical leaves.
     retroButton({48, 112, 56, 48}, "ALL", {UiActionKind::SelectArtistInitial}, enabled,
@@ -820,19 +838,26 @@ void UI::drawRetroBrowse(const UiModel& model, std::uint64_t ticks) {
     // Empty-state notices sit in front of the entire catalogue, including its hinge.
     if (count == 0) {
         const float noticeY = leftLeaf.y + (leftLeaf.h - 146) / 2;
-        panel({254, noticeY, 920, 146}, paper, red);
-        const bool building = model.buildingEmptyLibrary();
-        text(building ? (videos ? "BUILDING YOUR VIDEO COLLECTION" : "BUILDING YOUR RECORD COLLECTION")
-             : (videos ? "NO MATCHING VIDEOS" : "NO MATCHING RECORDS"), 714, noticeY + 28, 36, ink, 830, true);
-        text(building ? (videos ? "Your videos will appear here as they are found." : "Your music will appear here as it is found.")
-             : "Try ALL artists, a different search or another genre.", 714, noticeY + 84, 23, faded, 830, true);
+        if (radio) drawRadioNotice(model, {254, noticeY, 920, 146});
+        else {
+            panel({254, noticeY, 920, 146}, paper, red);
+            const bool building = model.buildingEmptyLibrary();
+            text(building ? (videos ? "BUILDING YOUR VIDEO COLLECTION" : "BUILDING YOUR RECORD COLLECTION")
+                 : (videos ? "NO MATCHING VIDEOS" : "NO MATCHING RECORDS"), 714, noticeY + 28, 36, ink, 830, true);
+            text(building ? (videos ? "Your videos will appear here as they are found." : "Your music will appear here as it is found.")
+                 : "Try ALL artists, a different search or another genre.", 714, noticeY + 84, 23, faded, 830, true);
+        }
     }
 
     retroButton({48, 992, 240, 60}, "<  PREVIOUS", {UiActionKind::PagePrevious}, enabled && !retroTurnDirection_ && page > 0);
-    text("PAGE " + std::to_string(page + 1) + " / " + std::to_string(pages) + "     •     " + std::to_string(count) + (videos ? " VIDEOS" : " RECORDS"),
+    text("PAGE " + std::to_string(page + 1) + " / " + std::to_string(pages) + "     •     " + std::to_string(count) + (radio ? " STATIONS" : videos ? " VIDEOS" : " RECORDS"),
          710, 988, 24, ink, 750, true, 29);
-    text(model.credits == 0 ? (videos ? "INSERT COIN → TOUCH A VIDEO → ADD TO QUEUE" : "INSERT COIN → TOUCH A RECORD → ADD TO QUEUE")
-                           : (videos ? "TOUCH A VIDEO → ADD TO QUEUE" : "TOUCH A RECORD → ADD TO QUEUE"),
+    const std::string instructions = radio
+        ? (model.credits == 0 ? "INSERT COIN → TOUCH A STATION → DINLE" : "TOUCH A STATION → DINLE")
+        : model.credits == 0 ? (videos ? "INSERT COIN → TOUCH A VIDEO → ADD TO QUEUE" : "INSERT COIN → TOUCH A RECORD → ADD TO QUEUE")
+                            : (videos ? "TOUCH A VIDEO → ADD TO QUEUE" : "TOUCH A RECORD → ADD TO QUEUE");
+    text(radio && model.radioFetching ? "Refreshing radio stations..." :
+         radio && !model.radioStatus.empty() && count > 0 ? model.radioStatus : instructions,
          710, 1025, 18, red, 770, true, 23);
     retroButton({1132, 992, 240, 60}, "NEXT  >", {UiActionKind::PageNext}, enabled && !retroTurnDirection_ && page + 1 < pages);
 
@@ -856,8 +881,8 @@ void UI::drawRetroBrowse(const UiModel& model, std::uint64_t ticks) {
     const std::string credits = (model.credits < 10 ? "0" : "") + std::to_string(model.credits);
     text(credits, 1504, 252, 39, green, 100, true, 42, true);
     phosphor({1582, 226, 294, 72});
-    text("TIME LEFT", 1729, 234, 13, dimGreen, 264, true, 17, true);
-    const auto remaining = model.currentTrack && model.playback.durationMs > 0
+    text(currentRadio || radioConnecting ? "RADYO" : "TIME LEFT", 1729, 234, 13, dimGreen, 264, true, 17, true);
+    const auto remaining = radioConnecting ? "CONNECTING" : currentRadio ? "CANLI" : model.currentTrack && model.playback.durationMs > 0
         ? formatDuration(model.playback.durationMs - std::clamp<std::int64_t>(
             model.playback.positionMs, 0, model.playback.durationMs))
         : "--:--";
@@ -867,8 +892,9 @@ void UI::drawRetroBrowse(const UiModel& model, std::uint64_t ticks) {
     text("PLAYLIST  /  " + std::to_string(queued) + " REQUESTS", 1658, 812, 18, ink, 412, true, 23);
     phosphor({1440, 840, 436, 134});
     if (queued == 0) {
-        text("THE NEXT RECORD IS YOURS", 1658, 868, 21, green, 388, true, 28, true);
-        text("Automatic shuffle is active", 1658, 917, 15, dimGreen, 388, true, 21, true);
+        text(radio || currentRadio ? "LIVE RADIO" : "THE NEXT RECORD IS YOURS", 1658, 868, 21, green, 388, true, 28, true);
+        text(currentRadio ? "Live radio is playing" : radio ? "Select a station to listen live" : "Automatic shuffle is active",
+             1658, 917, 15, dimGreen, 388, true, 21, true);
     } else {
         const auto shown = std::min<std::size_t>(3, queued);
         for (std::size_t i = 0; i < shown; ++i) {
@@ -885,7 +911,8 @@ void UI::drawRetroBrowse(const UiModel& model, std::uint64_t ticks) {
     drawVisualizer(meter, model.visualizerMode);
     if (unblocked) addHit(meter, {UiActionKind::OpenVisualizer});
     retroButton({1440, 984, 204, 66}, "INSERT COIN", {UiActionKind::InsertCoin}, unblocked);
-    retroButton({1658, 984, 218, 66}, "ADD TO QUEUE", {UiActionKind::AddSelected}, enabled && model.selectedTrack, true);
+    retroButton({1658, 984, 218, 66}, model.selectedTrack && model.selectedTrack->mediaKind == MediaKind::Radio ? "DINLE" : "ADD TO QUEUE",
+                {UiActionKind::AddSelected}, enabled && model.selectedTrack, true);
     if (browse && model.adminReveal)
         retroButton({8, 8, 210, 76}, "ADMIN", {UiActionKind::OpenAdmin}, true);
 }

@@ -85,6 +85,7 @@ bool matchesArtistInitial(std::wstring_view artist, char initial) {
 }  // namespace
 
 TrackLabel trackLabel(const Track& track) {
+    if (track.mediaKind == MediaKind::Radio) return {track.title, track.title};
     if (track.mediaKind != MediaKind::Video) return {track.artist, track.title};
     const auto trim = [](std::string value) {
         const auto first = value.find_first_not_of(" \t\r\n");
@@ -147,6 +148,8 @@ LibraryIndex LibraryScanner::scan(std::span<const std::filesystem::path> musicRo
     };
     for (const auto& track : cached.tracks) {
         if (cancelled()) return result;
+        // Radio is merged by App after local scans; never use it as file metadata.
+        if (track.mediaKind == MediaKind::Radio) continue;
         cachedByPath.emplace(cacheKey(track.path), &track);
     }
     const std::unordered_set<std::string> favorites(favoriteIds.begin(), favoriteIds.end());
@@ -273,6 +276,7 @@ std::vector<std::size_t> LibraryScanner::filter(const LibraryIndex& library,
         if (filter == LibraryFilter::Favorites && !track.favorite) continue;
         if (filter == LibraryFilter::Music && track.mediaKind != MediaKind::Music) continue;
         if (filter == LibraryFilter::Video && track.mediaKind != MediaKind::Video) continue;
+        if (filter == LibraryFilter::Radio && track.mediaKind != MediaKind::Radio) continue;
         if (!genreNeedle.empty() && normalizeForSearch(track.genre) != genreNeedle) continue;
         const auto label = trackLabel(track);
         auto artist = browseName(label.artist);

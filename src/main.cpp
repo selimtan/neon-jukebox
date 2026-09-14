@@ -1,4 +1,6 @@
 #include <SDL3/SDL_main.h>
+#include <Windows.h>
+#include <roapi.h>
 
 #include <string>
 
@@ -16,6 +18,16 @@ int main(int, char**) {
     if (!instance.isPrimary()) {
         neon::SingleInstance::activateExistingWindow();
         return 0;
+    }
+    // Keep Windows Runtime alive for the whole application, including the gaps
+    // between radio/media workers. The window thread already pumps STA messages.
+    struct Runtime {
+        HRESULT result{RoInitialize(RO_INIT_SINGLETHREADED)};
+        ~Runtime() { if (SUCCEEDED(result)) RoUninitialize(); }
+    } runtime;
+    if (FAILED(runtime.result)) {
+        MessageBoxW(nullptr, L"Unable to initialize Windows media playback.", L"Neon Jukebox", MB_OK | MB_ICONERROR);
+        return 1;
     }
     neon::App app;
     return app.run();

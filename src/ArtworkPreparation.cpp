@@ -105,6 +105,7 @@ void LibraryArtworkPreparer::enqueue(std::span<const Track> tracks) {
     if (!state_ || state_->stop.stop_requested()) return;
     std::lock_guard lock(state_->mutex);
     for (const auto& track : tracks) {
+        if (track.mediaKind == MediaKind::Radio) continue;
         const auto version = versionKey(track);
         const auto found = state_->latest.find(track.id);
         if (found != state_->latest.end() && found->second == version) continue;

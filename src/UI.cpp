@@ -277,7 +277,44 @@ void UI::notifyAction(const UiAction& action) {
     feedbackElapsed_ = 0;
 }
 
+std::string UI::radioSubtitle(const Track& track) {
+    std::string subtitle;
+    const auto title = normalizeForSearch(track.title);
+    std::vector<std::string> seen{title};
+    for (const auto* value : {&track.artist, &track.genre, &track.album}) {
+        const auto normalized = normalizeForSearch(*value);
+        if (normalized.empty() || normalized == "unknown artist" ||
+            normalized == "unknown genre" || normalized == "unknown album" ||
+            std::find(seen.begin(), seen.end(), normalized) != seen.end()) continue;
+        if (!subtitle.empty()) subtitle += " · ";
+        subtitle += *value;
+        seen.push_back(normalized);
+    }
+    return subtitle.empty() ? "RADIO STATION" : subtitle;
+}
+
+void UI::drawRadioNotice(const UiModel& model, const SDL_FRect& rect) {
+    const bool retro = model.theme == Theme::Retro;
+    const bool filtered = !model.search.empty() || !model.selectedGenre.empty() || model.selectedArtistInitial;
+    const std::string heading = model.radioFetching ? "LOADING RADIO STATIONS" :
+        filtered ? "NO MATCHING STATIONS" : "NO RADIO STATIONS AVAILABLE";
+    const std::string detail = !model.radioStatus.empty() ? model.radioStatus :
+        model.radioFetching ? "Finding live stations. Please wait..." :
+        filtered ? "Try ALL, a different search or another genre." :
+        "Check your connection and select RADYO to try again.";
+    panel(rect, retro ? SDL_Color{247, 245, 229, 255} : panelFill,
+          retro ? SDL_Color{157, 49, 41, 255} : cyan);
+    text(heading, rect.x + rect.w / 2, rect.y + 25, retro ? 34 : 28,
+         retro ? SDL_Color{32, 38, 31, 255} : cyan, rect.w - 48, true, 42);
+    text(detail, rect.x + rect.w / 2, rect.y + 84, retro ? 23 : 20,
+         retro ? SDL_Color{92, 98, 87, 255} : muted, rect.w - 48, true, 36);
+}
+
 void UI::drawBrowse(const UiModel& model) {
+    const bool radio = model.libraryFilter == LibraryFilter::Radio;
+    const bool currentRadio = model.currentTrack && model.currentTrack->mediaKind == MediaKind::Radio;
+    const bool selectedRadio = model.selectedTrack && model.selectedTrack->mediaKind == MediaKind::Radio;
+    const bool radioConnecting = !model.radioLoadingStatus.empty();
     const bool browseMode = model.mode == UiMode::Browse;
     const bool genreButtonEnabled = browseMode && model.credits > 0 &&
                                 !model.keyboardOpen && !model.playNowPrompt && !model.visualizerOpen;
@@ -285,19 +322,21 @@ void UI::drawBrowse(const UiModel& model) {
     const bool coinEnabled = browseMode && !model.keyboardOpen && !model.playNowPrompt &&
                              !model.visualizerOpen && !model.genreMenuOpen;
     // Two navigation rows span the cabinet, as in Retro, with Neon styling.
-    const SDL_FRect search{30, 22, 800, 62};
-    button(search, model.search.empty() ? "SEARCH TITLE / ARTIST / ALBUM" : ellipsize(model.search, 58),
+    const SDL_FRect search{30, 22, 690, 62};
+    button(search, model.search.empty() ? (radio ? "SEARCH RADIO STATIONS" : "SEARCH TITLE / ARTIST / ALBUM") : ellipsize(model.search, 48),
            {UiActionKind::OpenKeyboard}, visitorEnabled, cyan);
     const std::string genreCaption = model.selectedGenre.empty()
         ? "ALL GENRES  ▼" : ellipsize(model.selectedGenre, 34) + "  ▼";
-    button({842, 22, 480, 62}, genreCaption, {UiActionKind::ToggleGenreMenu},
+    button({732, 22, 450, 62}, genreCaption, {UiActionKind::ToggleGenreMenu},
            genreButtonEnabled,
            model.genreMenuOpen ? pink
                                : model.libraryFilter == LibraryFilter::All ? cyan : muted);
-    button({1334, 22, 272, 62}, "MUSIC", {UiActionKind::ShowMusic}, visitorEnabled,
+    button({1194, 22, 224, 62}, "MUSIC", {UiActionKind::ShowMusic}, visitorEnabled,
            model.libraryFilter == LibraryFilter::Music ? cyan : muted);
-    button({1618, 22, 272, 62}, "VIDEO", {UiActionKind::ShowVideo}, visitorEnabled,
+    button({1430, 22, 224, 62}, "VIDEO", {UiActionKind::ShowVideo}, visitorEnabled,
            model.libraryFilter == LibraryFilter::Video ? pink : muted);
+    button({1666, 22, 224, 62}, "RADYO", {UiActionKind::ShowRadio}, visitorEnabled,
+           radio ? cyan : muted);
     button({30, 96, 68, 48}, "ALL", {UiActionKind::SelectArtistInitial}, visitorEnabled,
            model.selectedArtistInitial == '\0' ? cyan : panelBorder);
     button({106, 96, 68, 48}, "0–9", {UiActionKind::SelectArtistInitial, 0, '#'}, visitorEnabled,
@@ -326,7 +365,7 @@ void UI::drawBrowse(const UiModel& model) {
     }
     text(model.currentTrack ? ellipsize(model.currentTrack->title, 30) : "Waiting for a request",
          235, 552, 30, white, 350, true);
-    text(model.currentTrack ? ellipsize(model.currentTrack->artist, 34) : "Queue a track to begin",
+    text(model.currentTrack ? ellipsize(currentRadio ? radioSubtitle(*model.currentTrack) : model.currentTrack->artist, 34) : "Queue a track to begin",
          235, 594, 21, muted, 350, true);
     std::string currentMetadata;
     if (model.currentTrack && model.currentTrack->genre != "Unknown Genre") {
@@ -336,9 +375,11 @@ void UI::drawBrowse(const UiModel& model) {
         if (!currentMetadata.empty()) currentMetadata += " · ";
         currentMetadata += std::to_string(model.currentTrack->albumYear);
     }
+    if (currentRadio) currentMetadata.clear();
     if (!model.videoLoadingStatus.empty()) currentMetadata = model.videoLoadingStatus;
+    if (radioConnecting) currentMetadata = model.radioLoadingStatus;
     text(ellipsize(currentMetadata, 36), 235, 620, 15, muted, 350, true);
-    const float progress = model.playback.durationMs > 0
+    const float progress = !currentRadio && !radioConnecting && model.playback.durationMs > 0
         ? std::clamp(static_cast<float>(model.playback.positionMs) / static_cast<float>(model.playback.durationMs), 0.0F, 1.0F) : 0.0F;
     // The progress and visualizer block starts one former credit-row lower so
     // artist/genre/year text always has clear space above the progress bar.
@@ -346,8 +387,13 @@ void UI::drawBrowse(const UiModel& model) {
     SDL_FRect progressFront{65, 658, 340 * progress, 8};
     SDL_SetRenderDrawColor(renderer_, 35, 43, 68, 255); SDL_RenderFillRect(renderer_, &progressBack);
     SDL_SetRenderDrawColor(renderer_, pink.r, pink.g, pink.b, 255); SDL_RenderFillRect(renderer_, &progressFront);
-    text(formatDuration(model.playback.positionMs), 65, 675, 17, muted);
-    text(formatDuration(model.playback.durationMs), 405, 675, 17, muted, 0, true);
+    if (currentRadio || radioConnecting) {
+        fillCircle(renderer_, 77, 687, 5, radioConnecting ? pink : cyan);
+        text(radioConnecting ? "CONNECTING" : "CANLI · LIVE", 94, 675, 17, cyan, 310);
+    } else {
+        text(formatDuration(model.playback.positionMs), 65, 675, 17, muted);
+        text(formatDuration(model.playback.durationMs), 405, 675, 17, muted, 0, true);
+    }
     const SDL_FRect compactVisualizer{65, 716, 340, 120};
     drawVisualizer(compactVisualizer, model.visualizerMode);
     if (browseMode && !model.keyboardOpen && !model.playNowPrompt && !model.visualizerOpen) {
@@ -357,7 +403,7 @@ void UI::drawBrowse(const UiModel& model) {
     text("SELECTED", 58, 842, 17, pink);
     text(model.selectedTrack ? ellipsize(model.selectedTrack->title, 30) : "Tap a track",
          58, 870, 23, white, 345);
-    text(model.selectedTrack ? ellipsize(model.selectedTrack->artist, 34) : "",
+    text(model.selectedTrack ? ellipsize(selectedRadio ? radioSubtitle(*model.selectedTrack) : model.selectedTrack->artist, 34) : "",
          58, 900, 17, muted, 345);
     std::string selectedMetadata;
     if (model.selectedTrack && model.selectedTrack->genre != "Unknown Genre") {
@@ -367,7 +413,7 @@ void UI::drawBrowse(const UiModel& model) {
         if (!selectedMetadata.empty()) selectedMetadata += " · ";
         selectedMetadata += std::to_string(model.selectedTrack->albumYear);
     }
-    text(ellipsize(selectedMetadata, 38), 58, 924, 14, muted, 345);
+    text(selectedRadio ? "CANLI · LIVE" : ellipsize(selectedMetadata, 38), 58, 924, 14, selectedRadio ? cyan : muted, 345);
     const SDL_FRect coinButton{58, 946, 170, 64};
     panel(coinButton,
           coinEnabled ? SDL_Color{22, 29, 58, 255} : SDL_Color{13, 17, 31, 230},
@@ -379,12 +425,13 @@ void UI::drawBrowse(const UiModel& model) {
          coinEnabled && model.credits > 0 ? cyan : muted,
          coinButton.w - 20.0F, true);
     if (coinEnabled) addHit(coinButton, {UiActionKind::InsertCoin});
-    button({240, 946, 172, 64}, "ADD TO QUEUE", {UiActionKind::AddSelected},
+    button({240, 946, 172, 64}, selectedRadio ? "PLAY RADIO" : "ADD TO QUEUE", {UiActionKind::AddSelected},
            visitorEnabled && model.selectedTrack != nullptr, pink);
 
     panel({460, 160, 940, 870}, {9, 13, 29, 238}, panelBorder);
     std::string libraryTitle = model.libraryFilter == LibraryFilter::Music ? "MUSIC LIBRARY" :
                                model.libraryFilter == LibraryFilter::Video ? "VIDEO LIBRARY" :
+                               radio ? "RADYO · LIVE STATIONS" :
                                model.libraryFilter == LibraryFilter::Favorites ? "FAVORITES" : "ALL MEDIA";
     if (!model.selectedGenre.empty()) {
         libraryTitle = ellipsize(model.selectedGenre, 18) + " / " + libraryTitle;
@@ -394,8 +441,9 @@ void UI::drawBrowse(const UiModel& model) {
     const auto filteredCount = model.filtered ? model.filtered->size() : 0;
     text(std::to_string(filteredCount) + " RESULTS", 1280, 191, 17, muted, 90, true);
     if (!model.filtered || model.filtered->empty()) {
-        text(model.buildingEmptyLibrary() ? "Building your library..." : "No matching media found",
-             930, 485, 30, muted, 700, true);
+        if (radio) drawRadioNotice(model, {500, 450, 860, 146});
+        else text(model.buildingEmptyLibrary() ? "Building your library..." : "No matching media found",
+                  930, 485, 30, muted, 700, true);
     } else {
         const std::size_t start = model.page * pageSize;
         for (std::size_t visible = 0; visible < pageSize && start + visible < model.filtered->size(); ++visible) {
@@ -418,16 +466,20 @@ void UI::drawBrowse(const UiModel& model) {
             if (track.mediaKind == MediaKind::Video)
                 text("VIDEO", card.x + 182, card.y + 105, 13, pink, 70, true);
             const auto label = trackLabel(track);
-            text(ellipsize(label.title, 25), card.x + 16, card.y + 132, 21, white, card.w - 32);
-            text(ellipsize(label.artist, 28), card.x + 16, card.y + 162, 17, cyan, card.w - 32);
-            std::string cardMetadata = formatDuration(track.durationMs);
-            if (track.genre != "Unknown Genre") cardMetadata += " · " + track.genre;
-            if (track.albumYear > 0) cardMetadata += " · " + std::to_string(track.albumYear);
-            text(ellipsize(cardMetadata, 32), card.x + 16, card.y + 191, 16, muted,
+            const bool station = track.mediaKind == MediaKind::Radio;
+            text(ellipsize(station ? track.title : label.title, 25), card.x + 16, card.y + 132, 21, white, card.w - 32);
+            text(ellipsize(station ? radioSubtitle(track) : label.artist, 28), card.x + 16, card.y + 162, 17, cyan, card.w - 32);
+            std::string cardMetadata = station ? "CANLI · LIVE" : formatDuration(track.durationMs);
+            if (!station && track.genre != "Unknown Genre") cardMetadata += " · " + track.genre;
+            if (!station && track.albumYear > 0) cardMetadata += " · " + std::to_string(track.albumYear);
+            text(ellipsize(cardMetadata, 32), card.x + 16, card.y + 191, 16, station ? pink : muted,
                  card.w - 32);
             if (visitorEnabled) addHit(card, {UiActionKind::SelectTrack, trackIndex});
         }
         const std::size_t pages = (filteredCount + pageSize - 1) / pageSize;
+        if (radio && (model.radioFetching || !model.radioStatus.empty()))
+            text(model.radioFetching ? "Refreshing radio stations..." : model.radioStatus,
+                 930, pages > 1 ? 999.0F : 975.0F, 14, cyan, pages > 1 ? 450.0F : 840.0F, true, 20);
         if (pages > 1) {
             button({490, 950, 190, 68}, "PREVIOUS", {UiActionKind::PagePrevious},
                    visitorEnabled && model.page > 0, cyan);
@@ -443,7 +495,8 @@ void UI::drawBrowse(const UiModel& model) {
     const std::size_t queued = model.queue ? model.queue->size() : 0;
     text(std::to_string(queued) + " REQUESTS", 1800, 191, 17, pink, 70, true);
     if (!model.queue || model.queue->empty()) {
-        text("Automatic shuffle is active", 1655, 480, 25, muted, 360, true);
+        text(currentRadio ? "Live radio is playing" : radio ? "Select a station to listen live" : "Automatic shuffle is active",
+             1655, 480, 25, muted, 360, true);
     } else {
         const std::size_t shown = std::min<std::size_t>(10, model.queue->size());
         for (std::size_t i = 0; i < shown; ++i) {
@@ -482,8 +535,8 @@ void UI::drawGenreMenu(const UiModel& model) {
     const float menuHeight = 58.0F + static_cast<float>(shown) * 72.0F +
                              (paged ? 82.0F : 14.0F);
     const bool retro = model.theme == Theme::Retro;
-    const SDL_FRect menu = retro ? SDL_FRect{604, 112, 364, menuHeight}
-                                : SDL_FRect{842, 96, 480, menuHeight};
+    const SDL_FRect menu = retro ? SDL_FRect{504, 112, 384, menuHeight}
+                                : SDL_FRect{732, 96, 450, menuHeight};
 
     SDL_SetRenderDrawColor(renderer_, 2, 4, 12, 150);
     const SDL_FRect shade = retro ? SDL_FRect{0, 104, 1920, 976}
@@ -546,8 +599,9 @@ void UI::drawSetupFolder(const UiModel& model) {
     button({1050, 560, 380, 78}, "SELECT VIDEO FOLDERS",
            {UiActionKind::ChooseVideoFolders}, true, pink);
 
-    button({700, 760, 520, 86}, "CONTINUE TO JUKEBOX", {UiActionKind::FinishFolderSetup},
-           model.musicSourceCount + model.videoSourceCount > 0, pink);
+    text("Folders are optional. Select RADYO in the jukebox to listen online; radio needs internet.",
+         960, 704, 21, cyan, 1100, true, 34);
+    button({700, 760, 520, 86}, "CONTINUE TO JUKEBOX", {UiActionKind::FinishFolderSetup}, true, pink);
     text(model.toast, 960, 875, 20, muted, 1060, true, 36);
 }
 
