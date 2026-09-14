@@ -3,7 +3,7 @@
 #include <memory>
 #include <string>
 
-#include "neon/Models.hpp"
+#include "neon/Audio.hpp"
 
 namespace neon {
 
@@ -40,6 +40,7 @@ public:
     [[nodiscard]] bool takeFinished();
     [[nodiscard]] std::string takeError();
     [[nodiscard]] float volume() const;
+    [[nodiscard]] AudioVisualizationFrame visualization();
 
 private:
     struct Impl;

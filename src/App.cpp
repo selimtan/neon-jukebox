@@ -716,7 +716,7 @@ void App::render() {
     model.selectedTrack = selectedTrack();
     model.playback = playbackSnapshot();
     if (SDL_GetTicks() - lastSpectrumUpdate_ >= 33) {
-        visualization_ = currentIsRadio() ? AudioVisualizationFrame{} :
+        visualization_ = currentIsRadio() ? radio_.visualization() :
             currentIsVideo() ? video_.visualization() : audio_.visualization();
         lastSpectrumUpdate_ = SDL_GetTicks();
     }

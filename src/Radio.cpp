@@ -1,14 +1,22 @@
 #include "neon/Radio.hpp"
 #include "neon/RadioDirectory.hpp"
 
+#include <SDL3/SDL.h>
+
 #include <Windows.h>
+#include <audioclient.h>
+#include <ksmedia.h>
+#include <mmdeviceapi.h>
+#include <mmreg.h>
 #include <roapi.h>
+#include <wrl/client.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -16,6 +24,7 @@
 #include <mutex>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace neon {
 namespace {
@@ -25,6 +34,7 @@ using winrt::Windows::Media::Core::MediaSource;
 using winrt::Windows::Media::Playback::MediaPlayer;
 using winrt::Windows::Media::Playback::MediaPlaybackSession;
 using winrt::Windows::Media::Playback::MediaPlaybackState;
+using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
@@ -33,6 +43,182 @@ struct Apartment {
     Apartment() : result(RoInitialize(RO_INIT_MULTITHREADED)) {}
     ~Apartment() { if (SUCCEEDED(result)) RoUninitialize(); }
     HRESULT result{};
+};
+
+// Windows MediaPlayer does not expose decoded PCM samples. Capture the default
+// render endpoint in loopback mode so radio uses the same visualizer data as
+// local music and video playback.
+class RadioLoopbackAnalyzer {
+public:
+    ~RadioLoopbackAnalyzer() { stop(); }
+
+    void start() {
+        stop();
+        stopping_.store(false, std::memory_order_release);
+        try {
+            worker_ = std::thread([this] { run(); });
+        } catch (...) {
+            // Visualization is optional; a capture-thread failure must not
+            // interrupt radio playback.
+            stopping_.store(true, std::memory_order_release);
+        }
+    }
+
+    void stop() {
+        stopping_.store(true, std::memory_order_release);
+        if (worker_.joinable()) worker_.join();
+    }
+
+    AudioVisualizationFrame frame() { return analyzer_.frame(); }
+
+private:
+    static bool isFloatFormat(const WAVEFORMATEX& format) {
+        if (format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
+        if (format.wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
+            format.cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) return false;
+        const auto& extended = reinterpret_cast<const WAVEFORMATEXTENSIBLE&>(format);
+        return IsEqualGUID(extended.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) != FALSE;
+    }
+
+    static bool isPcmFormat(const WAVEFORMATEX& format) {
+        if (format.wFormatTag == WAVE_FORMAT_PCM) return true;
+        if (format.wFormatTag != WAVE_FORMAT_EXTENSIBLE ||
+            format.cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) return false;
+        const auto& extended = reinterpret_cast<const WAVEFORMATEXTENSIBLE&>(format);
+        return IsEqualGUID(extended.SubFormat, KSDATAFORMAT_SUBTYPE_PCM) != FALSE;
+    }
+
+    void pushPacket(const WAVEFORMATEX& format, const BYTE* data, UINT32 frames,
+                    DWORD flags, std::vector<float>& converted) {
+        const int channels = std::max(1, static_cast<int>(format.nChannels));
+        const std::size_t sampleCount = static_cast<std::size_t>(frames) *
+                                        static_cast<std::size_t>(channels);
+        if (sampleCount == 0) return;
+        SDL_AudioSpec spec{};
+        spec.format = SDL_AUDIO_F32;
+        spec.channels = channels;
+        spec.freq = static_cast<int>(format.nSamplesPerSec);
+
+        if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data) {
+            converted.assign(sampleCount, 0.0F);
+            analyzer_.push(spec, converted.data(), static_cast<int>(converted.size()));
+            return;
+        }
+
+        const std::size_t bytesPerSample = format.nBlockAlign /
+                                           static_cast<std::size_t>(channels);
+        if (isFloatFormat(format) && bytesPerSample == sizeof(float)) {
+            analyzer_.push(spec, reinterpret_cast<const float*>(data),
+                           static_cast<int>(sampleCount));
+            return;
+        }
+
+        converted.resize(sampleCount);
+        if (isFloatFormat(format) && bytesPerSample == sizeof(double)) {
+            const auto* source = reinterpret_cast<const double*>(data);
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                converted[i] = std::clamp(static_cast<float>(source[i]), -1.0F, 1.0F);
+            }
+        } else if (isPcmFormat(format) && bytesPerSample == 1) {
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                converted[i] = (static_cast<float>(data[i]) - 128.0F) / 128.0F;
+            }
+        } else if (isPcmFormat(format) && bytesPerSample == 2) {
+            const auto* source = reinterpret_cast<const std::int16_t*>(data);
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                converted[i] = static_cast<float>(source[i]) / 32768.0F;
+            }
+        } else if (isPcmFormat(format) && bytesPerSample == 3) {
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                const auto* source = data + i * 3;
+                std::int32_t value = static_cast<std::int32_t>(source[0]) |
+                    (static_cast<std::int32_t>(source[1]) << 8) |
+                    (static_cast<std::int32_t>(source[2]) << 16);
+                if ((value & 0x00800000) != 0) value |= static_cast<std::int32_t>(0xFF000000);
+                converted[i] = static_cast<float>(value) / 8388608.0F;
+            }
+        } else if (isPcmFormat(format) && bytesPerSample == 4) {
+            const auto* source = reinterpret_cast<const std::int32_t*>(data);
+            for (std::size_t i = 0; i < sampleCount; ++i) {
+                converted[i] = static_cast<float>(static_cast<double>(source[i]) / 2147483648.0);
+            }
+        } else {
+            return;
+        }
+        analyzer_.push(spec, converted.data(), static_cast<int>(converted.size()));
+    }
+
+    bool captureSession() {
+        ComPtr<IMMDeviceEnumerator> enumerator;
+        HRESULT result = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                          IID_PPV_ARGS(&enumerator));
+        if (FAILED(result)) return false;
+
+        ComPtr<IMMDevice> device;
+        result = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+        if (FAILED(result)) result = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        if (FAILED(result)) return false;
+
+        ComPtr<IAudioClient> client;
+        result = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                  reinterpret_cast<void**>(client.GetAddressOf()));
+        if (FAILED(result)) return false;
+
+        WAVEFORMATEX* rawFormat{};
+        result = client->GetMixFormat(&rawFormat);
+        if (FAILED(result) || !rawFormat) return false;
+        const std::unique_ptr<WAVEFORMATEX, decltype(&CoTaskMemFree)>
+            format(rawFormat, &CoTaskMemFree);
+
+        constexpr REFERENCE_TIME bufferDuration = 1'000'000;  // 100 ms.
+        result = client->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                    bufferDuration, 0, format.get(), nullptr);
+        if (FAILED(result)) return false;
+
+        ComPtr<IAudioCaptureClient> capture;
+        result = client->GetService(IID_PPV_ARGS(&capture));
+        if (FAILED(result) || FAILED(client->Start())) return false;
+
+        std::vector<float> converted;
+        bool healthy = true;
+        while (!stopping_.load(std::memory_order_acquire)) {
+            UINT32 packetFrames{};
+            result = capture->GetNextPacketSize(&packetFrames);
+            if (FAILED(result)) { healthy = false; break; }
+            while (packetFrames > 0 && !stopping_.load(std::memory_order_acquire)) {
+                BYTE* data{};
+                UINT32 frames{};
+                DWORD flags{};
+                result = capture->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
+                if (FAILED(result)) { healthy = false; break; }
+                pushPacket(*format, data, frames, flags, converted);
+                if (FAILED(capture->ReleaseBuffer(frames))) { healthy = false; break; }
+                result = capture->GetNextPacketSize(&packetFrames);
+                if (FAILED(result)) { healthy = false; break; }
+            }
+            if (!healthy) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        client->Stop();
+        return healthy;
+    }
+
+    void run() {
+        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE) return;
+        const bool ownsCom = SUCCEEDED(comResult);
+        while (!stopping_.load(std::memory_order_acquire)) {
+            if (captureSession()) break;
+            for (int wait = 0; wait < 50 && !stopping_.load(std::memory_order_acquire); ++wait) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        if (ownsCom) CoUninitialize();
+    }
+
+    SpectrumAnalyzer analyzer_;
+    std::atomic_bool stopping_{true};
+    std::thread worker_;
 };
 
 std::string currentError(const char* context) {
@@ -318,8 +504,10 @@ struct RadioEngine::Impl {
     mutable std::mutex mutex;
     std::shared_ptr<RadioState> state = std::make_shared<RadioState>();
     std::thread worker;
+    RadioLoopbackAnalyzer loopback;
 
     void shutdown() {
+        loopback.stop();
         {
             std::lock_guard lock(state->mutex);
             state->stopping = true;
@@ -405,15 +593,19 @@ bool RadioEngine::play(const Track& track, std::string& error) {
         state->url = track.streamUrl;
         state->active = state->loading = true;
     }
+    impl_->loopback.start();
     state->wake.notify_all();
     return true;
 }
 
 void RadioEngine::stop() {
     std::lock_guard apiLock(impl_->mutex);
-    std::lock_guard lock(impl_->state->mutex);
-    impl_->state->clearPlayback();
+    {
+        std::lock_guard lock(impl_->state->mutex);
+        impl_->state->clearPlayback();
+    }
     impl_->state->wake.notify_all();
+    impl_->loopback.stop();
 }
 
 bool RadioEngine::pause() {
@@ -487,6 +679,18 @@ float RadioEngine::volume() const {
     std::lock_guard apiLock(impl_->mutex);
     std::lock_guard lock(impl_->state->mutex);
     return impl_->state->volume;
+}
+
+AudioVisualizationFrame RadioEngine::visualization() {
+    std::lock_guard apiLock(impl_->mutex);
+    {
+        std::lock_guard lock(impl_->state->mutex);
+        const auto& state = *impl_->state;
+        if (!state.active || !state.playing || state.loading || state.paused) {
+            return {};
+        }
+    }
+    return impl_->loopback.frame();
 }
 
 }  // namespace neon

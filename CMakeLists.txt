@@ -242,8 +242,9 @@ if(NEON_BUILD_TESTING)
     endif()
     add_test(NAME neon_radio_directory_tests COMMAND neon_radio_tests)
 
-    add_executable(neon_radio_playback_tests tests/test_radio_playback.cpp src/Radio.cpp)
-    target_link_libraries(neon_radio_playback_tests PRIVATE neon_core windowsapp ole32 ws2_32)
+    add_executable(neon_radio_playback_tests tests/test_radio_playback.cpp src/Radio.cpp src/Audio.cpp)
+    target_link_libraries(neon_radio_playback_tests PRIVATE neon_core
+        SDL3::SDL3-static SDL3_mixer::SDL3_mixer-static windowsapp ole32 uuid ws2_32)
     if(MSVC)
         target_compile_options(neon_radio_playback_tests PRIVATE /W4 /permissive- /utf-8)
     endif()
